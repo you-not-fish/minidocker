@@ -35,25 +35,30 @@ var runCmd = &cobra.Command{
 }
 
 func init() {
-	runCmd.Flags().BoolVarP(&tty, "tty", "t", false, "分配伪终端 (pseudo-TTY)")
-	runCmd.Flags().BoolVarP(&interactive, "interactive", "i", false, "保持 STDIN 打开")
+	// NOTE: Phase 1 暂不实现 PTY 分配/终端控制。保留 `-t/-i` 形态用于减少后续
+	// Phase 5（exec -it / 真实 TTY）引入时的 CLI 破坏性变更。
+	runCmd.Flags().BoolVarP(&tty, "tty", "t", false, "TTY 模式（预留：Phase 1 不分配 PTY）")
+	runCmd.Flags().BoolVarP(&interactive, "interactive", "i", false, "保持 STDIN 打开（预留：Phase 1 默认已透传 STDIN）")
 }
 
 func runContainer(cmd *cobra.Command, args []string) error {
 	config := &runtime.ContainerConfig{
 		Command: args[0:1],
 		Args:    args[1:],
-		TTY:     tty && interactive, // -it 必须一起使用以启用完整的交互模式
+		// Phase 1: 记录 `-t` 但不分配 PTY（见 docs/phase1-dev-notes.md）。
+		TTY: tty,
 	}
 
 	// 生成容器 ID（12位十六进制，用作默认主机名）
 	config.ID = runtime.GenerateContainerID()
 	config.Hostname = config.ID[:12]
 
-	if err := runtime.Run(config); err != nil {
+	exitCode, err := runtime.Run(config)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
-	return nil
+	os.Exit(exitCode)
+	return nil // unreachable
 }

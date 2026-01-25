@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -127,34 +128,28 @@ func runUserCommand(config *ContainerConfig) int {
 	// 清除 MINIDOCKER_* 环境变量，以防泄露到容器中
 	var filteredEnv []string
 	for _, env := range cmd.Env {
-		if len(env) >= len(initEnvVar) && env[:len(initEnvVar)] == initEnvVar {
+		if strings.HasPrefix(env, initEnvVar+"=") {
 			continue
 		}
-		if len(env) >= len(configEnvVar) && env[:len(configEnvVar)] == configEnvVar {
+		if strings.HasPrefix(env, configEnvVar+"=") {
 			continue
 		}
 		filteredEnv = append(filteredEnv, env)
 	}
 	cmd.Env = filteredEnv
 
-	// 启动用户命令
-	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "init: failed to start command: %v\n", err)
-		return 1
-	}
-
-	// 设置信号处理
-	// 我们需要将信号转发给子进程并回收僵尸进程
+	// 设置信号处理（并在其中启动用户命令）
+	// PID 1 必须能转发信号并回收僵尸进程
 	return handleSignalsAndWait(cmd)
 }
 
-// handleSignalsAndWait manages signal forwarding and zombie reaping.
-// This is the core PID 1 responsibility.
+// handleSignalsAndWait 负责：
+// - 启动主子进程（用户命令）
+// - SIGCHLD：回收僵尸进程（包括孙进程）
+// - SIGTERM/SIGINT/SIGHUP/SIGQUIT：转发给主子进程
 //
-// Design notes:
-// - SIGCHLD: Must be handled to reap zombie processes
-// - SIGTERM, SIGINT, SIGHUP: Forward to the main child process
-// - Other signals: Can be forwarded or ignored based on policy
+// 关键点：必须在启动主子进程前安装 signal.Notify，否则主子进程“秒退”时可能丢 SIGCHLD，
+// 从而导致 init 阻塞等待信号（假死）。
 func handleSignalsAndWait(cmd *exec.Cmd) int {
 	// 用于接收信号的通道
 	sigChan := make(chan os.Signal, 10)
@@ -171,10 +166,21 @@ func handleSignalsAndWait(cmd *exec.Cmd) int {
 	)
 	defer signal.Stop(sigChan)
 
+	// 启动用户命令（必须在 signal.Notify 之后）
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "init: failed to start command: %v\n", err)
+		return 1
+	}
+
 	// 跟踪主子进程
 	mainChildPid := cmd.Process.Pid
 	var mainChildExitCode int
 	mainChildExited := false
+
+	// 处理“主子进程极快退出”的情况：即使还没收到 SIGCHLD，也先做一次非阻塞回收。
+	if exitCode, childExited := reapZombies(mainChildPid); childExited {
+		return exitCode
+	}
 
 	// 主循环：等待信号并处理它们
 	for {

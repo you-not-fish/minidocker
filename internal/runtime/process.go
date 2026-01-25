@@ -20,30 +20,35 @@ const initEnvVar = "MINIDOCKER_INIT"
 const configEnvVar = "MINIDOCKER_CONFIG"
 
 // Run 使用给定的配置创建并运行一个新容器。
-// 这是 CLI 的主要入口点。
-func Run(config *ContainerConfig) error {
+//
+// 注意：这个函数不应该调用 os.Exit。
+// 退出码应由 CLI（或后续阶段的 daemon/manager）统一处理，这样才能自然支撑：
+// - Phase 3: run -d / 状态持久化（state.json）
+// - Phase 3+: 日志重定向、stop/exec
+// - 可选：daemon / API 形态复用 runtime
+func Run(config *ContainerConfig) (int, error) {
 	// 创建将生成容器的父进程
 	cmd, err := newParentProcess(config)
 	if err != nil {
-		return fmt.Errorf("failed to create parent process: %w", err)
+		return -1, fmt.Errorf("failed to create parent process: %w", err)
 	}
 
 	// 启动子进程（将成为容器 init）
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start container process: %w", err)
+		return -1, fmt.Errorf("failed to start container process: %w", err)
 	}
 
 	// 等待容器退出
 	// 容器 init 的退出代码将被传播
 	if err := cmd.Wait(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			// 传播容器的退出代码
-			os.Exit(exitErr.ExitCode())
+			// 非 0 退出码是 `run` 的正常结果之一，不应在 runtime 层作为 Go error 传播。
+			return exitErr.ExitCode(), nil
 		}
-		return fmt.Errorf("container exited with error: %w", err)
+		return -1, fmt.Errorf("container exited with error: %w", err)
 	}
 
-	return nil
+	return 0, nil
 }
 
 // newParentProcess 创建一个新命令，该命令将在启用命名空间隔离的情况下
@@ -51,8 +56,10 @@ func Run(config *ContainerConfig) error {
 //
 // 重新执行模式是必要的，因为：
 // 1. Go 的运行时在 main() 运行之前会生成多个线程
-// 2. Linux namespaces 必须在任何线程存在之前配置
-// 3. 通过重新执行我们自己，我们确保 init 进程重新开始
+// 2. 在 Go 中直接在当前进程内做会影响整个进程/线程组的 namespace 操作需要非常谨慎，
+//    否则容易受到运行时多线程的影响而产生难以定位的问题
+// 3. 通过 re-exec，子进程从一开始就处在目标 namespace 中，并进入明确的 init(PID1) 路径，
+//    组织方式更贴近 runc
 func newParentProcess(config *ContainerConfig) (*exec.Cmd, error) {
 	// 重新执行当前二进制文件
 	// /proc/self/exe 始终指向当前可执行文件

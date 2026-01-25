@@ -11,8 +11,8 @@ import (
 
 // Run 在非 Linux 平台上不受支持。
 // 容器依赖于 Linux 特有的特性，如 namespaces 和 cgroups。
-func Run(config *ContainerConfig) error {
-	return fmt.Errorf("minidocker only supports Linux (current OS: %s)", runtime.GOOS)
+func Run(config *ContainerConfig) (int, error) {
+	return -1, fmt.Errorf("minidocker only supports Linux (current OS: %s)", runtime.GOOS)
 }
 
 // newParentProcess 在非 Linux 平台上不受支持。
