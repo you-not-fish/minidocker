@@ -501,3 +501,22 @@ func TestUTSNamespace(t *testing.T) {
 		t.Error("Container UTS namespace should be different from host")
 	}
 }
+
+// TestRootfsBasic 测试基本的 rootfs 功能（快速冒烟测试）
+func TestRootfsBasic(t *testing.T) {
+	skipIfNotRoot(t)
+
+	rootfs := prepareMinimalRootfs(t)
+	defer os.RemoveAll(rootfs)
+
+	// 只依赖 /bin/sh（避免对 rootfs 内其他二进制的隐式依赖）
+	cmd := exec.Command(minidockerBin, "run", "--rootfs", rootfs, "/bin/sh", "-c", "echo hello")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("minidocker run with rootfs failed: %v\nOutput: %s", err, output)
+	}
+
+	if !strings.Contains(string(output), "hello") {
+		t.Errorf("Expected output 'hello', got: %s", output)
+	}
+}

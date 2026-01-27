@@ -61,6 +61,12 @@ func getConfigFromEnv() (*ContainerConfig, error) {
 // setupContainerEnvironment 配置容器环境。
 // 这将在命名空间隔离到位后调用。
 func setupContainerEnvironment(config *ContainerConfig) error {
+	// Phase 2 关键调整：setupRootfs() 必须在所有其他操作之前执行！
+	// 原因：pivot_root 会改变根目录，影响后续所有路径操作
+	if err := setupRootfs(config); err != nil {
+		return fmt.Errorf("setup rootfs: %w", err)
+	}
+
 	// 1. 设置主机名（UTS namespace 必须被隔离）
 	hostname := config.GetHostname()
 	if err := unix.Sethostname([]byte(hostname)); err != nil {
@@ -73,17 +79,10 @@ func setupContainerEnvironment(config *ContainerConfig) error {
 		return err
 	}
 
-	// 3. 为新的 PID namespace 挂载 /proc
-	// 这对于像 'ps' 这样的工具正确工作是必要的
-	// 注意：在第2阶段，这将在 pivot_root 之后完成
-	if err := mountProc(); err != nil {
-		// 如果 /proc 挂载失败，不要报错 - 它可能已经挂载
-		// 或者我们可能还没有正确的 rootfs（第1阶段的限制）
-		fmt.Fprintf(os.Stderr, "init: warning: failed to mount /proc: %v\n", err)
-	}
+	// 3. Phase 2 移除旧的 mountProc() 调用
+	// 因为 setupRootfs() 已经在 pivot_root 后正确挂载了 /proc
 
 	// 未来扩展点（第2阶段+）：
-	// - setupRootfs(config)   // 第2阶段: pivot_root
 	// - setupCgroups(config)  // 第6阶段: cgroup 资源限制
 	// - setupNetwork(config)  // 第7阶段: 网络配置
 	// - setupMounts(config)   // 第10阶段: 卷挂载
@@ -91,20 +90,8 @@ func setupContainerEnvironment(config *ContainerConfig) error {
 	return nil
 }
 
-// mountProc 为容器的 PID namespace 挂载一个新的 /proc 文件系统。
-// 这允许 'ps'、'/proc/self/*' 等在容器内正确工作。
-func mountProc() error {
-	// 首先，尝试卸载任何现有的 /proc
-	// 忽略错误，因为它可能未挂载
-	_ = unix.Unmount("/proc", unix.MNT_DETACH)
-
-	// 挂载新的 proc 文件系统
-	if err := unix.Mount("proc", "/proc", "proc", 0, ""); err != nil {
-		return fmt.Errorf("mount proc: %w", err)
-	}
-
-	return nil
-}
+// mountProc 已迁移到 rootfs.go（Phase 2）
+// 保留此注释以标记历史变更
 
 // runUserCommand 执行用户命令并处理信号转发 + 僵尸进程回收。
 // 返回用户命令的退出代码。
