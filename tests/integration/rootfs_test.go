@@ -245,17 +245,20 @@ func TestBackwardCompatibilityNoRootfs(t *testing.T) {
 //
 // 当前实现的准备策略（按优先级）：
 // 1) 若设置环境变量 MINIDOCKER_TEST_ROOTFS=<dir>：
-//    - 递归复制该目录到临时目录后返回（避免修改原目录）
+//   - 递归复制该目录到临时目录后返回（避免修改原目录）
+//
 // 2) 若宿主可用 docker：
-//    - docker export busybox 到临时目录（若 busybox 镜像不存在可能触发 pull，因此这一步可能失败）
+//   - docker export busybox 到临时目录（若 busybox 镜像不存在可能触发 pull，因此这一步可能失败）
+//
 // 3) 若宿主有 busybox 可执行文件：
-//    - 构建一个最小 busybox rootfs（/bin/busybox + /bin/sh 等软链）
-//    - 若 busybox 为动态链接，会额外复制其依赖库到 rootfs
+//   - 构建一个最小 busybox rootfs（/bin/busybox + /bin/sh 等软链）
+//   - 若 busybox 为动态链接，会额外复制其依赖库到 rootfs
+//
 // 4) 兜底：复制宿主 /bin/sh（或 PATH 中的 sh）到 rootfs，并复制动态依赖库（通过 ldd）
 //
 // 说明：
-// - Phase 2 的 rootfs 测试用例已尽量只依赖 /bin/sh（以及其内建 test/echo/redirection），
-//   这样 rootfs 构建可以非常小，且对宿主环境更友好。
+//   - Phase 2 的 rootfs 测试用例已尽量只依赖 /bin/sh（以及其内建 test/echo/redirection），
+//     这样 rootfs 构建可以非常小，且对宿主环境更友好。
 func prepareMinimalRootfs(t *testing.T) string {
 	t.Helper()
 

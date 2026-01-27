@@ -14,8 +14,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )

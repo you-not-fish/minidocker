@@ -29,7 +29,9 @@ var rootCmd = &cobra.Command{
   - (未来) 使用 cgroups 进行资源限制
   - (未来) 用于镜像的 Overlay 文件系统
   - (未来) 容器网络`,
-	Version: Version,
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	Version:       Version,
 }
 
 // Execute 运行根命令
@@ -43,9 +45,12 @@ func Execute() {
 func init() {
 	// 添加子命令
 	rootCmd.AddCommand(runCmd)
-	rootCmd.AddCommand(stopCmd) // Phase 3 新增
-	rootCmd.AddCommand(killCmd) // Phase 3 新增
-	rootCmd.AddCommand(rmCmd)   // Phase 3 新增
+	rootCmd.AddCommand(stopCmd)    // Phase 3 新增
+	rootCmd.AddCommand(killCmd)    // Phase 3 新增
+	rootCmd.AddCommand(rmCmd)      // Phase 3 新增
+	rootCmd.AddCommand(psCmd)      // Phase 4 新增
+	rootCmd.AddCommand(logsCmd)    // Phase 4 新增
+	rootCmd.AddCommand(inspectCmd) // Phase 4 新增
 
 	// Phase 3: 全局标志
 	rootCmd.PersistentFlags().StringVar(&rootDir, "root", "",
