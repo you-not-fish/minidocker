@@ -1,3 +1,6 @@
+//go:build linux
+// +build linux
+
 package cli
 
 import (
@@ -6,6 +9,7 @@ import (
 	"path/filepath"
 
 	"minidocker/internal/runtime"
+	"minidocker/internal/state"
 
 	"github.com/spf13/cobra"
 )
@@ -15,6 +19,8 @@ var (
 	tty         bool
 	interactive bool
 	rootfs      string // Phase 2 新增
+	detach      bool   // Phase 3 新增：后台运行
+	// name     string // Phase 11 实现：容器名称
 )
 
 var runCmd = &cobra.Command{
@@ -31,7 +37,8 @@ var runCmd = &cobra.Command{
 示例:
   minidocker run /bin/sh
   minidocker run -it /bin/bash
-  minidocker run /bin/echo "Hello from container"`,
+  minidocker run /bin/echo "Hello from container"
+  minidocker run -d --rootfs /tmp/rootfs /bin/sleep 100`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: runContainer,
 }
@@ -44,6 +51,12 @@ func init() {
 
 	// Phase 2 新增：rootfs 参数
 	runCmd.Flags().StringVar(&rootfs, "rootfs", "", "容器根文件系统路径（例如：busybox 解压目录）")
+
+	// Phase 3 新增：后台运行
+	runCmd.Flags().BoolVarP(&detach, "detach", "d", false, "后台运行容器并输出容器 ID")
+
+	// Phase 11 预留：容器名称（当前不实现）
+	// runCmd.Flags().StringVar(&name, "name", "", "容器名称")
 }
 
 func runContainer(cmd *cobra.Command, args []string) error {
@@ -68,22 +81,37 @@ func runContainer(cmd *cobra.Command, args []string) error {
 		rootfs = absRootfs
 	}
 
+	// Phase 3: 初始化状态存储
+	store, err := state.NewStore(rootDir)
+	if err != nil {
+		return fmt.Errorf("failed to initialize state store: %w", err)
+	}
+
 	config := &runtime.ContainerConfig{
 		Command: args[0:1],
 		Args:    args[1:],
 		// Phase 1: 记录 `-t` 但不分配 PTY（见 docs/phase1-dev-notes.md）。
-		TTY:    tty,
-		Rootfs: rootfs, // Phase 2 新增
+		TTY:      tty,
+		Rootfs:   rootfs, // Phase 2 新增
+		Detached: detach, // Phase 3 新增
 	}
 
-	// 生成容器 ID（12位十六进制，用作默认主机名）
+	// 生成容器 ID（64位十六进制，前12位用作默认主机名）
 	config.ID = runtime.GenerateContainerID()
 	config.Hostname = config.ID[:12]
 
-	exitCode, err := runtime.Run(config)
+	// Phase 3: 传入状态存储
+	exitCode, err := runtime.Run(config, &runtime.RunOptions{
+		StateStore: store,
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
+	}
+
+	// Phase 3: 后台模式输出容器 ID
+	if detach {
+		fmt.Println(config.ID)
 	}
 
 	os.Exit(exitCode)

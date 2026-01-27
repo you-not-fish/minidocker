@@ -12,6 +12,8 @@ import (
 	"strings"
 	"syscall"
 
+	"minidocker/internal/state"
+
 	"golang.org/x/sys/unix"
 )
 
@@ -26,7 +28,7 @@ import (
 // 此设计与 tini/dumb-init 的行为一致。
 func RunContainerInit() {
 	// 从环境获取容器配置
-	config, err := getConfigFromEnv()
+	config, err := getConfig()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "init: failed to get config: %v\n", err)
 		os.Exit(1)
@@ -43,19 +45,42 @@ func RunContainerInit() {
 	os.Exit(exitCode)
 }
 
-// getConfigFromEnv 从环境变量中以获取容器配置。
-func getConfigFromEnv() (*ContainerConfig, error) {
-	configJSON := os.Getenv(configEnvVar)
-	if configJSON == "" {
-		return nil, fmt.Errorf("missing %s environment variable", configEnvVar)
+// getConfig returns the container config for init(PID1).
+//
+// Phase 3 improvement: prefer loading persisted `config.json` from the container "bundle" directory
+// (passed via MINIDOCKER_STATE_PATH), instead of passing a potentially large JSON blob via env vars.
+//
+// Backward compatibility: if MINIDOCKER_CONFIG is present, it is still accepted.
+func getConfig() (*ContainerConfig, error) {
+	// Backward-compatible env JSON (Phase 1/2)
+	if configJSON := os.Getenv(configEnvVar); strings.TrimSpace(configJSON) != "" {
+		var cfg ContainerConfig
+		if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
+			return nil, fmt.Errorf("failed to parse %s: %w", configEnvVar, err)
+		}
+		return &cfg, nil
 	}
 
-	var config ContainerConfig
-	if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
-		return nil, fmt.Errorf("failed to parse config: %w", err)
+	// Preferred: load config.json from bundle/container dir.
+	containerDir := os.Getenv(statePathEnvVar)
+	if strings.TrimSpace(containerDir) == "" {
+		return nil, fmt.Errorf("missing %s environment variable", statePathEnvVar)
 	}
 
-	return &config, nil
+	cfg, err := state.LoadConfig(containerDir)
+	if err != nil {
+		return nil, fmt.Errorf("load config from %s: %w", containerDir, err)
+	}
+
+	return &ContainerConfig{
+		ID:       cfg.ID,
+		Command:  cfg.Command,
+		Args:     cfg.Args,
+		Hostname: cfg.Hostname,
+		TTY:      cfg.TTY,
+		Rootfs:   cfg.Rootfs,
+		Detached: cfg.Detached,
+	}, nil
 }
 
 // setupContainerEnvironment 配置容器环境。
@@ -119,6 +144,10 @@ func runUserCommand(config *ContainerConfig) int {
 			continue
 		}
 		if strings.HasPrefix(env, configEnvVar+"=") {
+			continue
+		}
+		// Phase 3 新增：过滤状态目录路径环境变量
+		if strings.HasPrefix(env, statePathEnvVar+"=") {
 			continue
 		}
 		filteredEnv = append(filteredEnv, env)

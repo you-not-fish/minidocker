@@ -9,7 +9,12 @@ import (
 
 var (
 	// 版本信息
-	Version   = "0.1.0"
+	Version = "0.1.0"
+
+	// 全局标志
+	// rootDir 是容器状态根目录
+	// 默认值：$MINIDOCKER_ROOT 环境变量，或 /var/lib/minidocker
+	rootDir string
 )
 
 var rootCmd = &cobra.Command{
@@ -38,7 +43,11 @@ func Execute() {
 func init() {
 	// 添加子命令
 	rootCmd.AddCommand(runCmd)
+	rootCmd.AddCommand(stopCmd) // Phase 3 新增
+	rootCmd.AddCommand(killCmd) // Phase 3 新增
+	rootCmd.AddCommand(rmCmd)   // Phase 3 新增
 
-	// 全局标志可以在此处添加
-	// rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file")
+	// Phase 3: 全局标志
+	rootCmd.PersistentFlags().StringVar(&rootDir, "root", "",
+		"容器状态根目录（默认: $MINIDOCKER_ROOT 或 /var/lib/minidocker）")
 }

@@ -16,5 +16,12 @@ func main() {
 		return
 	}
 
+	// Phase 3: per-container shim for detached containers.
+	// This process stays alive to reap the container init and persist exit code/state.
+	if os.Getenv("MINIDOCKER_SHIM") == "1" {
+		runtime.RunContainerShim()
+		return
+	}
+
 	cli.Execute()
 }

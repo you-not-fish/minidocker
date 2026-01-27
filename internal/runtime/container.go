@@ -37,8 +37,16 @@ type ContainerConfig struct {
 	// Rootfs 是根文件系统的路径（第2阶段：--rootfs）
 	Rootfs string
 
+	// Detached 指示容器是否后台运行（第3阶段：-d）
+	Detached bool
+
 	// User 指定在容器内运行的用户（第11阶段：--user）
 	User string
+
+	// --- Phase 11 预留字段（当前不实现） ---
+	// Name 是容器名称，用于替代 ID 进行引用
+	// 在 Phase 11 实现完整的名称到 ID 映射功能
+	// Name string
 
 	// --- 用于未来扩展的占位符字段 ---
 	// 这些被注释掉是为了避免循环导入和未使用的代码警告。
@@ -81,5 +89,8 @@ func (c *ContainerConfig) GetHostname() string {
 
 // GetCommand 以单个切片形式返回完整命令（命令 + 参数）。
 func (c *ContainerConfig) GetCommand() []string {
-	return append(c.Command, c.Args...)
+	cmd := make([]string, 0, len(c.Command)+len(c.Args))
+	cmd = append(cmd, c.Command...)
+	cmd = append(cmd, c.Args...)
+	return cmd
 }
