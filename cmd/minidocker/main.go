@@ -23,5 +23,12 @@ func main() {
 		return
 	}
 
+	// Phase 5: exec init process (namespace joining)
+	// This process joins an existing container's namespaces and executes a command.
+	if os.Getenv("MINIDOCKER_EXEC") == "1" {
+		runtime.RunExecInit()
+		return
+	}
+
 	cli.Execute()
 }
