@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"minidocker/internal/cgroups"
+	"minidocker/internal/network"
 	"minidocker/internal/runtime"
 	"minidocker/internal/state"
 
@@ -33,6 +34,10 @@ var (
 	cpuQuota    int64  // --cpu-quota（高级）
 	cpuPeriod   int64  // --cpu-period（高级）
 	pidsLimit   int64  // --pids-limit
+
+	// Phase 7 新增：网络配置
+	networkMode  string   // --network，如 "bridge", "host", "none"
+	publishPorts []string // -p, --publish，如 "8080:80", "8080:80/tcp"
 )
 
 var runCmd = &cobra.Command{
@@ -45,11 +50,17 @@ var runCmd = &cobra.Command{
   - PID namespace (进程隔离)
   - Mount namespace (文件系统隔离)
   - IPC namespace (进程间通信隔离)
+  - Network namespace (网络隔离，Phase 7)
 
 资源限制（Phase 6，需要 cgroup v2）：
   - 内存限制: -m, --memory
   - CPU 限制: --cpus
   - 进程数限制: --pids-limit
+
+网络模式（Phase 7）：
+  - bridge: 默认模式，创建独立网络命名空间并连接到 minidocker0 bridge
+  - host: 共享宿主机网络
+  - none: 只有 loopback 的独立网络命名空间
 
 示例:
   minidocker run /bin/sh
@@ -57,7 +68,10 @@ var runCmd = &cobra.Command{
   minidocker run /bin/echo "Hello from container"
   minidocker run -d --rootfs /tmp/rootfs /bin/sleep 100
   minidocker run -m 512m --cpus 0.5 --rootfs /tmp/rootfs /bin/sh
-  minidocker run --pids-limit 100 --rootfs /tmp/rootfs /bin/sh`,
+  minidocker run --pids-limit 100 --rootfs /tmp/rootfs /bin/sh
+  minidocker run --network bridge --rootfs /tmp/rootfs /bin/sh
+  minidocker run --network host --rootfs /tmp/rootfs /bin/sh
+  minidocker run -p 8080:80 --rootfs /tmp/rootfs /bin/httpd`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: runContainer,
 }
@@ -81,6 +95,10 @@ func init() {
 	runCmd.Flags().Int64Var(&cpuQuota, "cpu-quota", 0, "CPU 配额（微秒，高级用户）")
 	runCmd.Flags().Int64Var(&cpuPeriod, "cpu-period", 100000, "CPU 周期（微秒，默认 100000）")
 	runCmd.Flags().Int64Var(&pidsLimit, "pids-limit", 0, "进程数限制")
+
+	// Phase 7 新增：网络配置
+	runCmd.Flags().StringVar(&networkMode, "network", "bridge", "网络模式（bridge/host/none）")
+	runCmd.Flags().StringArrayVarP(&publishPorts, "publish", "p", nil, "发布端口（格式: [hostIP:]hostPort:containerPort[/protocol]）")
 
 	// Phase 11 预留：容器名称（当前不实现）
 	// runCmd.Flags().StringVar(&name, "name", "", "容器名称")
@@ -121,6 +139,12 @@ func runContainer(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Phase 7: 解析网络配置
+	networkConfig, err := parseNetworkFlags()
+	if err != nil {
+		return fmt.Errorf("invalid network configuration: %w", err)
+	}
+
 	// Phase 3: 初始化状态存储
 	store, err := state.NewStore(rootDir)
 	if err != nil {
@@ -131,10 +155,11 @@ func runContainer(cmd *cobra.Command, args []string) error {
 		Command: args[0:1],
 		Args:    args[1:],
 		// Phase 1: 记录 `-t` 但不分配 PTY（见 docs/phase1-dev-notes.md）。
-		TTY:          tty,
-		Rootfs:       rootfs,       // Phase 2 新增
-		Detached:     detach,       // Phase 3 新增
-		CgroupConfig: cgroupConfig, // Phase 6 新增
+		TTY:           tty,
+		Rootfs:        rootfs,        // Phase 2 新增
+		Detached:      detach,        // Phase 3 新增
+		CgroupConfig:  cgroupConfig,  // Phase 6 新增
+		NetworkConfig: networkConfig, // Phase 7 新增
 	}
 
 	// 生成容器 ID（64位十六进制，前12位用作默认主机名）
@@ -306,4 +331,106 @@ func parseMemoryString(s string) (int64, error) {
 	}
 
 	return int64(num * float64(multiplier)), nil
+}
+
+// parseNetworkFlags 解析网络配置参数
+func parseNetworkFlags() (*network.NetworkConfig, error) {
+	config := &network.NetworkConfig{}
+
+	// 解析网络模式
+	switch strings.ToLower(networkMode) {
+	case "bridge":
+		config.Mode = network.NetworkModeBridge
+	case "host":
+		config.Mode = network.NetworkModeHost
+	case "none":
+		config.Mode = network.NetworkModeNone
+	default:
+		return nil, fmt.Errorf("unsupported network mode: %s (supported: bridge, host, none)", networkMode)
+	}
+
+	// 解析端口映射（仅 bridge 模式支持）
+	if len(publishPorts) > 0 {
+		if config.Mode != network.NetworkModeBridge {
+			return nil, fmt.Errorf("port mapping (-p) is only supported in bridge network mode")
+		}
+
+		for _, portSpec := range publishPorts {
+			pm, err := parsePortMapping(portSpec)
+			if err != nil {
+				return nil, fmt.Errorf("invalid port mapping %q: %w", portSpec, err)
+			}
+			config.PortMappings = append(config.PortMappings, pm)
+		}
+	}
+
+	return config, nil
+}
+
+// parsePortMapping 解析端口映射字符串
+// 支持格式:
+//   - hostPort:containerPort (例如: 8080:80)
+//   - hostPort:containerPort/protocol (例如: 8080:80/tcp)
+//   - hostIP:hostPort:containerPort (例如: 127.0.0.1:8080:80)
+//   - hostIP:hostPort:containerPort/protocol (例如: 127.0.0.1:8080:80/tcp)
+func parsePortMapping(spec string) (network.PortMapping, error) {
+	pm := network.PortMapping{
+		Protocol: "tcp", // 默认 TCP
+	}
+
+	// 分离协议部分
+	if idx := strings.LastIndex(spec, "/"); idx != -1 {
+		protocol := strings.ToLower(spec[idx+1:])
+		if protocol != "tcp" && protocol != "udp" {
+			return pm, fmt.Errorf("unsupported protocol: %s (supported: tcp, udp)", protocol)
+		}
+		pm.Protocol = protocol
+		spec = spec[:idx]
+	}
+
+	// 分离 hostIP:hostPort:containerPort 或 hostPort:containerPort
+	parts := strings.Split(spec, ":")
+	switch len(parts) {
+	case 2:
+		// hostPort:containerPort
+		hostPort, err := parsePort(parts[0])
+		if err != nil {
+			return pm, fmt.Errorf("invalid host port: %w", err)
+		}
+		containerPort, err := parsePort(parts[1])
+		if err != nil {
+			return pm, fmt.Errorf("invalid container port: %w", err)
+		}
+		pm.HostPort = hostPort
+		pm.ContainerPort = containerPort
+	case 3:
+		// hostIP:hostPort:containerPort
+		pm.HostIP = parts[0]
+		hostPort, err := parsePort(parts[1])
+		if err != nil {
+			return pm, fmt.Errorf("invalid host port: %w", err)
+		}
+		containerPort, err := parsePort(parts[2])
+		if err != nil {
+			return pm, fmt.Errorf("invalid container port: %w", err)
+		}
+		pm.HostPort = hostPort
+		pm.ContainerPort = containerPort
+	default:
+		return pm, fmt.Errorf("invalid format, expected hostPort:containerPort or hostIP:hostPort:containerPort")
+	}
+
+	return pm, nil
+}
+
+// parsePort 解析端口号字符串
+func parsePort(s string) (uint16, error) {
+	port, err := strconv.ParseUint(s, 10, 16)
+	if err != nil {
+		return 0, fmt.Errorf("invalid port number: %s", s)
+	}
+	if port == 0 {
+		return 0, fmt.Errorf("port must be between 1 and 65535")
+	}
+	return uint16(port), nil
 }

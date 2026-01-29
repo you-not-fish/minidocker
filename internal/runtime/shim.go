@@ -6,10 +6,12 @@ package runtime
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"minidocker/internal/cgroups"
+	"minidocker/internal/network"
 	"minidocker/internal/state"
 	"minidocker/pkg/envutil"
 )
@@ -25,6 +27,10 @@ import (
 // - 创建 cgroup 并将容器进程加入
 // - 容器退出后清理 cgroup
 //
+// Phase 7 更新：
+// - 配置网络（bridge/host/none 模式）
+// - 容器退出后清理网络资源
+//
 // This aligns with the industry "per-container shim" model (e.g. containerd-shim).
 func RunContainerShim() {
 	containerDir := os.Getenv(envutil.StatePathEnvVar)
@@ -34,11 +40,20 @@ func RunContainerShim() {
 	var cgroupManager cgroups.Manager
 	var cgroupPath string
 
+	// Phase 7: network 相关变量
+	var networkManager network.Manager
+	var networkState *network.NetworkState
+	var containerID string // 用于清理时引用
+
 	fail := func(format string, args ...any) {
 		msg := fmt.Sprintf(format, args...)
 		if notify != nil {
 			fmt.Fprintf(notify, "ERR: %s\n", msg)
 			notify.Close()
+		}
+		// Phase 7: 清理网络
+		if networkManager != nil && networkState != nil && containerID != "" {
+			_ = networkManager.Teardown(containerID, networkState)
 		}
 		// Phase 6: 清理 cgroup
 		if cgroupManager != nil && cgroupPath != "" {
@@ -57,6 +72,7 @@ func RunContainerShim() {
 	if err != nil {
 		fail("load config: %v", err)
 	}
+	containerID = cfg.ID // 设置 containerID 用于清理
 
 	// Load state.json (mutable)
 	st, err := state.LoadState(containerDir)
@@ -100,6 +116,47 @@ func RunContainerShim() {
 		st.CgroupPath = cgroupPath
 	}
 
+	// Phase 7: 从配置中恢复网络配置
+	if cfg.NetworkMode != "" {
+		rCfg.NetworkConfig = &network.NetworkConfig{
+			Mode: network.NetworkMode(cfg.NetworkMode),
+		}
+		if len(cfg.PortMappings) > 0 {
+			rCfg.NetworkConfig.PortMappings = make([]network.PortMapping, len(cfg.PortMappings))
+			for i, pm := range cfg.PortMappings {
+				rCfg.NetworkConfig.PortMappings[i] = network.PortMapping{
+					HostIP:        pm.HostIP,
+					HostPort:      pm.HostPort,
+					ContainerPort: pm.ContainerPort,
+					Protocol:      pm.Protocol,
+				}
+			}
+		}
+
+		// 在 state.json 中至少持久化网络模式（包括 host/none）。
+		// bridge 模式会在 Setup 后填充 IP/veth/portMappings 等详细信息。
+		st.NetworkState = &state.NetworkState{
+			Mode: cfg.NetworkMode,
+		}
+
+		// 初始化网络管理器并确保 bridge 存在
+		if rCfg.NetworkConfig.NeedsNetworkNamespace() {
+			// 获取 rootDir（从 containerDir 向上两级）
+			rootDir := filepath.Dir(filepath.Dir(containerDir))
+			networkManager, err = network.NewManager(rootDir)
+			if err != nil {
+				fail("initialize network manager: %v", err)
+			}
+
+			// 确保 bridge 存在（对于 bridge 模式）
+			if rCfg.NetworkConfig.GetMode() == network.NetworkModeBridge {
+				if err := networkManager.EnsureBridge(rCfg.NetworkConfig); err != nil {
+					fail("ensure bridge: %v", err)
+				}
+			}
+		}
+	}
+
 	// Open log files for the container init
 	logs, err := setupLogFiles(containerDir)
 	if err != nil {
@@ -128,6 +185,38 @@ func RunContainerShim() {
 		}
 	}
 
+	// Phase 7: 配置网络（需要 PID 来移动 veth 到容器网络命名空间）
+	if networkManager != nil && rCfg.NetworkConfig != nil {
+		networkState, err = networkManager.Setup(cfg.ID, rCfg.NetworkConfig, cmd.Process.Pid)
+		if err != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			logs.Close()
+			fail("setup network: %v", err)
+		}
+
+		// 保存网络状态到容器状态
+		st.NetworkState = &state.NetworkState{
+			Mode:          string(networkState.Mode),
+			IPAddress:     networkState.IPAddress,
+			Gateway:       networkState.Gateway,
+			MacAddress:    networkState.MacAddress,
+			VethHost:      networkState.VethHost,
+			VethContainer: networkState.VethContainer,
+		}
+		if len(networkState.PortMappings) > 0 {
+			st.NetworkState.PortMappings = make([]state.PortMapping, len(networkState.PortMappings))
+			for i, pm := range networkState.PortMappings {
+				st.NetworkState.PortMappings[i] = state.PortMapping{
+					HostIP:        pm.HostIP,
+					HostPort:      pm.HostPort,
+					ContainerPort: pm.ContainerPort,
+					Protocol:      pm.Protocol,
+				}
+			}
+		}
+	}
+
 	// Persist running state (must happen before notifying the parent)
 	if err := st.SetRunning(cmd.Process.Pid); err != nil {
 		_ = cmd.Process.Kill()
@@ -146,6 +235,11 @@ func RunContainerShim() {
 	exitCode := waitForExit(cmd)
 	_ = st.SetStopped(exitCode)
 	logs.Close()
+
+	// Phase 7: 清理网络（先于 cgroup）
+	if networkManager != nil && networkState != nil {
+		_ = networkManager.Teardown(cfg.ID, networkState)
+	}
 
 	// Phase 6: 清理 cgroup
 	if cgroupManager != nil && cgroupPath != "" {

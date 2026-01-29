@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"minidocker/internal/cgroups"
+	"minidocker/internal/network"
 	"minidocker/internal/state"
 
 	"github.com/spf13/cobra"
@@ -102,6 +103,35 @@ func removeContainer(store *state.Store, idOrPrefix string) error {
 				}
 				time.Sleep(100 * time.Millisecond)
 			}
+		}
+	}
+
+	// Phase 7: 清理网络（仅 bridge 模式会创建宿主侧资源：veth/iptables/IPAM）
+	// 清理顺序: Network → cgroup → 状态目录
+	if containerState.NetworkState != nil && containerState.NetworkState.Mode == string(network.NetworkModeBridge) {
+		if manager, err := network.NewManager(store.RootDir); err == nil {
+			// 转换 state.NetworkState 到 network.NetworkState
+			netState := &network.NetworkState{
+				Mode:          network.NetworkMode(containerState.NetworkState.Mode),
+				IPAddress:     containerState.NetworkState.IPAddress,
+				Gateway:       containerState.NetworkState.Gateway,
+				MacAddress:    containerState.NetworkState.MacAddress,
+				VethHost:      containerState.NetworkState.VethHost,
+				VethContainer: containerState.NetworkState.VethContainer,
+			}
+			if len(containerState.NetworkState.PortMappings) > 0 {
+				netState.PortMappings = make([]network.PortMapping, len(containerState.NetworkState.PortMappings))
+				for i, pm := range containerState.NetworkState.PortMappings {
+					netState.PortMappings[i] = network.PortMapping{
+						HostIP:        pm.HostIP,
+						HostPort:      pm.HostPort,
+						ContainerPort: pm.ContainerPort,
+						Protocol:      pm.Protocol,
+					}
+				}
+			}
+			// 忽略清理错误（网络资源可能已被清理）
+			_ = manager.Teardown(containerState.ID, netState)
 		}
 	}
 

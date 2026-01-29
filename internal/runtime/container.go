@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"minidocker/internal/cgroups"
+	"minidocker/internal/network"
 	"minidocker/pkg/idutil"
 )
 
@@ -52,12 +53,15 @@ type ContainerConfig struct {
 	// CgroupConfig 保存容器的资源限制配置（内存、CPU、进程数）
 	CgroupConfig *cgroups.CgroupConfig
 
+	// --- Phase 7: 网络配置 ---
+	// NetworkConfig 保存容器的网络配置（模式、端口映射等）
+	NetworkConfig *network.NetworkConfig
+
 	// --- 用于未来扩展的占位符字段 ---
 	// 这些被注释掉是为了避免循环导入和未使用的代码警告。
 	// 在后续阶段根据需要取消注释并实现。
 	//
-	// NetworkConfig *NetworkConfig // 第7阶段：网络配置
-	// Mounts        []Mount        // 第10阶段：卷挂载
+	// Mounts []Mount // 第10阶段：卷挂载
 }
 
 // GenerateContainerID 生成一个随机的64个字符的十六进制字符串。

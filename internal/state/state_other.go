@@ -25,6 +25,25 @@ type ContainerState struct{}
 // ContainerConfig 是容器配置的 stub
 type ContainerConfig struct{}
 
+// PortMapping 表示端口映射配置
+type PortMapping struct {
+	HostIP        string
+	HostPort      uint16
+	ContainerPort uint16
+	Protocol      string
+}
+
+// NetworkState 表示容器的网络状态
+type NetworkState struct {
+	Mode          string
+	IPAddress     string
+	Gateway       string
+	MacAddress    string
+	VethHost      string
+	VethContainer string
+	PortMappings  []PortMapping
+}
+
 // ContainerLock 是容器锁的 stub
 type ContainerLock struct{}
 

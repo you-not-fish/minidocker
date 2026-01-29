@@ -54,6 +54,13 @@ type ContainerConfig struct {
 	// 进程数限制
 	PidsLimit int64 `json:"pidsLimit,omitempty"`
 
+	// --- Phase 7: 网络配置 ---
+	// 网络模式（bridge/host/none）
+	NetworkMode string `json:"networkMode,omitempty"`
+
+	// 端口映射
+	PortMappings []PortMapping `json:"portMappings,omitempty"`
+
 	// --- Phase 11 预留字段（当前不实现）---
 	// Name 容器名称
 	// 在 Phase 11 实现完整的名称到 ID 的映射功能
@@ -123,4 +130,12 @@ func (c *ContainerConfig) ShortID() string {
 func (c *ContainerConfig) HasCgroupConfig() bool {
 	return c.Memory > 0 || c.MemorySwap != 0 ||
 		c.CPUQuota > 0 || c.PidsLimit > 0
+}
+
+// PortMapping 表示端口映射配置
+type PortMapping struct {
+	HostIP        string `json:"hostIP,omitempty"`
+	HostPort      uint16 `json:"hostPort"`
+	ContainerPort uint16 `json:"containerPort"`
+	Protocol      string `json:"protocol,omitempty"` // tcp/udp
 }

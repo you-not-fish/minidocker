@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"minidocker/internal/cgroups"
+	"minidocker/internal/network"
 	"minidocker/internal/state"
 	"minidocker/pkg/envutil"
 
@@ -53,6 +54,11 @@ func (l *logFiles) Close() {
 // - 在启动进程前创建 cgroup，启动后将 PID 加入 cgroup
 // - 容器退出后清理 cgroup
 //
+// Phase 7 更新：
+// - 集成网络配置（bridge/host/none 模式）
+// - 在启动进程后配置网络（需要 PID 来移动 veth）
+// - 容器退出后清理网络资源
+//
 // 注意：这个函数不应该调用 os.Exit。
 // 退出码应由 CLI（或后续阶段的 daemon/manager）统一处理。
 func Run(config *ContainerConfig, opts *RunOptions) (int, error) {
@@ -80,17 +86,47 @@ func Run(config *ContainerConfig, opts *RunOptions) (int, error) {
 		stateConfig.PidsLimit = config.CgroupConfig.PidsLimit
 	}
 
+	// Phase 7: 添加网络配置到状态
+	if config.NetworkConfig != nil {
+		stateConfig.NetworkMode = string(config.NetworkConfig.GetMode())
+		if len(config.NetworkConfig.PortMappings) > 0 {
+			stateConfig.PortMappings = make([]state.PortMapping, len(config.NetworkConfig.PortMappings))
+			for i, pm := range config.NetworkConfig.PortMappings {
+				stateConfig.PortMappings[i] = state.PortMapping{
+					HostIP:        pm.HostIP,
+					HostPort:      pm.HostPort,
+					ContainerPort: pm.ContainerPort,
+					Protocol:      pm.Protocol,
+				}
+			}
+		}
+	}
+
 	containerState, err := opts.StateStore.Create(stateConfig)
 	if err != nil {
 		return -1, fmt.Errorf("failed to create container state: %w", err)
 	}
 
-	// 清理函数：启动失败时删除状态目录和 cgroup
+	// Phase 7: 在 state.json 中至少持久化网络模式（包括 host/none）。
+	// bridge 模式会在 Setup 后填充 IP/veth/portMappings 等详细信息。
+	if config.NetworkConfig != nil && !config.NetworkConfig.IsEmpty() {
+		containerState.NetworkState = &state.NetworkState{
+			Mode: string(config.NetworkConfig.GetMode()),
+		}
+	}
+
+	// 清理函数：启动失败时删除状态目录、cgroup 和网络
 	cleanupOnError := true
 	var cgroupPath string
 	var cgroupManager cgroups.Manager
+	var networkManager network.Manager
+	var networkState *network.NetworkState
 	defer func() {
 		if cleanupOnError {
+			// Phase 7: 清理网络（先于 cgroup，因为网络需要容器信息）
+			if networkManager != nil && networkState != nil {
+				_ = networkManager.Teardown(config.ID, networkState)
+			}
 			// Phase 6: 清理 cgroup
 			if cgroupManager != nil && cgroupPath != "" {
 				_ = cgroupManager.Destroy(cgroupPath)
@@ -128,6 +164,22 @@ func Run(config *ContainerConfig, opts *RunOptions) (int, error) {
 		containerState.CgroupPath = cgroupPath
 	}
 
+	// Phase 7: 前台模式初始化网络管理器（后台模式由 shim 负责）
+	if config.NetworkConfig != nil && config.NetworkConfig.NeedsNetworkNamespace() {
+		var err error
+		networkManager, err = network.NewManager(opts.StateStore.RootDir)
+		if err != nil {
+			return -1, fmt.Errorf("failed to initialize network manager: %w", err)
+		}
+
+		// 确保 bridge 存在（对于 bridge 模式）
+		if config.NetworkConfig.GetMode() == network.NetworkModeBridge {
+			if err := networkManager.EnsureBridge(config.NetworkConfig); err != nil {
+				return -1, fmt.Errorf("failed to ensure bridge: %w", err)
+			}
+		}
+	}
+
 	// 2. 设置日志文件（前台模式）
 	logs, err := setupLogFiles(containerState.GetContainerDir())
 	if err != nil {
@@ -157,6 +209,39 @@ func Run(config *ContainerConfig, opts *RunOptions) (int, error) {
 		}
 	}
 
+	// Phase 7: 配置网络（需要 PID 来移动 veth 到容器网络命名空间）
+	if networkManager != nil && config.NetworkConfig != nil {
+		var err error
+		networkState, err = networkManager.Setup(config.ID, config.NetworkConfig, cmd.Process.Pid)
+		if err != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			logs.Close()
+			return -1, fmt.Errorf("failed to setup network: %w", err)
+		}
+
+		// 保存网络状态到容器状态
+		containerState.NetworkState = &state.NetworkState{
+			Mode:          string(networkState.Mode),
+			IPAddress:     networkState.IPAddress,
+			Gateway:       networkState.Gateway,
+			MacAddress:    networkState.MacAddress,
+			VethHost:      networkState.VethHost,
+			VethContainer: networkState.VethContainer,
+		}
+		if len(networkState.PortMappings) > 0 {
+			containerState.NetworkState.PortMappings = make([]state.PortMapping, len(networkState.PortMappings))
+			for i, pm := range networkState.PortMappings {
+				containerState.NetworkState.PortMappings[i] = state.PortMapping{
+					HostIP:        pm.HostIP,
+					HostPort:      pm.HostPort,
+					ContainerPort: pm.ContainerPort,
+					Protocol:      pm.Protocol,
+				}
+			}
+		}
+	}
+
 	// 5. 更新状态为 running
 	if err := containerState.SetRunning(cmd.Process.Pid); err != nil {
 		// 启动成功但状态更新失败，尝试杀死进程
@@ -173,6 +258,11 @@ func Run(config *ContainerConfig, opts *RunOptions) (int, error) {
 	exitCode := waitForExit(cmd)
 	containerState.SetStopped(exitCode)
 	logs.Close()
+
+	// Phase 7: 前台模式下清理网络（先于 cgroup）
+	if networkManager != nil && networkState != nil {
+		_ = networkManager.Teardown(config.ID, networkState)
+	}
 
 	// Phase 6: 前台模式下清理 cgroup
 	if cgroupManager != nil && cgroupPath != "" {
@@ -307,17 +397,24 @@ func newParentProcess(config *ContainerConfig, containerDir string, logs *logFil
 
 	// 使用克隆标志配置命名空间隔离
 	// 这些标志告诉内核为子进程创建新的命名空间
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWUTS | // 新的 UTS namespace (主机名)
-			syscall.CLONE_NEWPID | // 新的 PID namespace (进程 ID)
-			syscall.CLONE_NEWNS | // 新的 Mount namespace (文件系统挂载)
-			syscall.CLONE_NEWIPC, // 新的 IPC namespace (System V IPC, POSIX 消息队列)
-		// 注意：CLONE_NEWNET 未包含在第1阶段中。
-		// 网络命名空间将在第7阶段 (feat-network-bridge) 中添加。
-		// 目前，容器共享主机网络。
+	cloneFlags := syscall.CLONE_NEWUTS | // 新的 UTS namespace (主机名)
+		syscall.CLONE_NEWPID | // 新的 PID namespace (进程 ID)
+		syscall.CLONE_NEWNS | // 新的 Mount namespace (文件系统挂载)
+		syscall.CLONE_NEWIPC // 新的 IPC namespace (System V IPC, POSIX 消息队列)
 
-		// 注意：CLONE_NEWUSER 未包含在第1阶段中。
-		// 用户命名空间将在第16阶段 (feat-rootless) 中添加。
+	// Phase 7: 根据网络配置决定是否创建网络命名空间
+	// - bridge 模式: 需要 CLONE_NEWNET（容器有独立网络栈）
+	// - none 模式: 需要 CLONE_NEWNET（容器有独立但空的网络栈）
+	// - host 模式: 不需要 CLONE_NEWNET（共享宿主机网络）
+	if config.NetworkConfig != nil && config.NetworkConfig.NeedsNetworkNamespace() {
+		cloneFlags |= syscall.CLONE_NEWNET
+	}
+
+	// 注意：CLONE_NEWUSER 未包含在第1阶段中。
+	// 用户命名空间将在第16阶段 (feat-rootless) 中添加。
+
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags: uintptr(cloneFlags),
 	}
 
 	// 后台模式：创建新会话，脱离控制终端

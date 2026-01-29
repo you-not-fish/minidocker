@@ -49,8 +49,22 @@ type ContainerState struct {
 	// 格式: minidocker/<container-id>
 	CgroupPath string `json:"cgroupPath,omitempty"`
 
+	// Phase 7: 网络状态
+	NetworkState *NetworkState `json:"networkState,omitempty"`
+
 	// 内部字段（不序列化）
 	containerDir string
+}
+
+// NetworkState 表示容器的网络状态
+type NetworkState struct {
+	Mode          string        `json:"mode"`
+	IPAddress     string        `json:"ipAddress,omitempty"`
+	Gateway       string        `json:"gateway,omitempty"`
+	MacAddress    string        `json:"macAddress,omitempty"`
+	VethHost      string        `json:"vethHost,omitempty"`
+	VethContainer string        `json:"vethContainer,omitempty"`
+	PortMappings  []PortMapping `json:"portMappings,omitempty"`
 }
 
 // NewState 创建一个新的容器状态
@@ -130,7 +144,8 @@ func (s *ContainerState) Reload() error {
 	s.StartedAt = newState.StartedAt
 	s.FinishedAt = newState.FinishedAt
 	s.ExitCode = newState.ExitCode
-	s.CgroupPath = newState.CgroupPath // Phase 6
+	s.CgroupPath = newState.CgroupPath       // Phase 6
+	s.NetworkState = newState.NetworkState   // Phase 7
 
 	return nil
 }

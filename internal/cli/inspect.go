@@ -59,6 +59,9 @@ type StateInfo struct {
 	ExitCode   int        `json:"ExitCode"`
 	StartedAt  *time.Time `json:"StartedAt,omitempty"`
 	FinishedAt *time.Time `json:"FinishedAt,omitempty"`
+
+	// Phase 7: 网络状态（对齐 Docker inspect 的体验，且便于集成测试验收）
+	NetworkState *state.NetworkState `json:"networkState,omitempty"`
 }
 
 // ConfigInfo 表示容器配置信息
@@ -139,12 +142,13 @@ func inspectContainer(store *state.Store, idOrPrefix string) (*InspectOutput, er
 		ID:      containerState.ID,
 		Created: containerState.CreatedAt,
 		State: StateInfo{
-			Status:     string(containerState.Status),
-			Running:    containerState.Status == state.StatusRunning,
-			Pid:        containerState.Pid,
-			ExitCode:   exitCode,
-			StartedAt:  containerState.StartedAt,
-			FinishedAt: containerState.FinishedAt,
+			Status:       string(containerState.Status),
+			Running:      containerState.Status == state.StatusRunning,
+			Pid:          containerState.Pid,
+			ExitCode:     exitCode,
+			StartedAt:    containerState.StartedAt,
+			FinishedAt:   containerState.FinishedAt,
+			NetworkState: containerState.NetworkState,
 		},
 		Config: ConfigInfo{
 			Hostname: config.Hostname,
