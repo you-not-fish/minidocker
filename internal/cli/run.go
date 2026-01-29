@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
+	"minidocker/internal/cgroups"
 	"minidocker/internal/runtime"
 	"minidocker/internal/state"
 
@@ -21,6 +24,14 @@ var (
 	rootfs      string // Phase 2 新增
 	detach      bool   // Phase 3 新增：后台运行
 	// name     string // Phase 11 实现：容器名称
+
+	// Phase 6 新增：资源限制
+	memoryLimit string // -m, --memory，如 "512m", "1g"
+	memorySwap  string // --memory-swap
+	cpus        string // --cpus，如 "0.5", "2"
+	cpuQuota    int64  // --cpu-quota（高级）
+	cpuPeriod   int64  // --cpu-period（高级）
+	pidsLimit   int64  // --pids-limit
 )
 
 var runCmd = &cobra.Command{
@@ -34,11 +45,18 @@ var runCmd = &cobra.Command{
   - Mount namespace (文件系统隔离)
   - IPC namespace (进程间通信隔离)
 
+资源限制（Phase 6，需要 cgroup v2）：
+  - 内存限制: -m, --memory
+  - CPU 限制: --cpus
+  - 进程数限制: --pids-limit
+
 示例:
   minidocker run /bin/sh
   minidocker run -it /bin/bash
   minidocker run /bin/echo "Hello from container"
-  minidocker run -d --rootfs /tmp/rootfs /bin/sleep 100`,
+  minidocker run -d --rootfs /tmp/rootfs /bin/sleep 100
+  minidocker run -m 512m --cpus 0.5 --rootfs /tmp/rootfs /bin/sh
+  minidocker run --pids-limit 100 --rootfs /tmp/rootfs /bin/sh`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: runContainer,
 }
@@ -54,6 +72,14 @@ func init() {
 
 	// Phase 3 新增：后台运行
 	runCmd.Flags().BoolVarP(&detach, "detach", "d", false, "后台运行容器并输出容器 ID")
+
+	// Phase 6 新增：资源限制
+	runCmd.Flags().StringVarP(&memoryLimit, "memory", "m", "", "内存限制（例如: 512m, 1g）")
+	runCmd.Flags().StringVar(&memorySwap, "memory-swap", "", "内存+交换空间限制（-1 不限制）")
+	runCmd.Flags().StringVar(&cpus, "cpus", "", "CPU 核数限制（例如: 0.5, 2）")
+	runCmd.Flags().Int64Var(&cpuQuota, "cpu-quota", 0, "CPU 配额（微秒，高级用户）")
+	runCmd.Flags().Int64Var(&cpuPeriod, "cpu-period", 100000, "CPU 周期（微秒，默认 100000）")
+	runCmd.Flags().Int64Var(&pidsLimit, "pids-limit", 0, "进程数限制")
 
 	// Phase 11 预留：容器名称（当前不实现）
 	// runCmd.Flags().StringVar(&name, "name", "", "容器名称")
@@ -81,6 +107,19 @@ func runContainer(cmd *cobra.Command, args []string) error {
 		rootfs = absRootfs
 	}
 
+	// Phase 6: 解析资源限制
+	cgroupConfig, err := parseCgroupFlags()
+	if err != nil {
+		return fmt.Errorf("invalid resource limits: %w", err)
+	}
+
+	// Phase 6: 检查 cgroup v2 支持
+	if cgroupConfig != nil && !cgroupConfig.IsEmpty() {
+		if !cgroups.IsCgroupV2() {
+			return fmt.Errorf("resource limits require cgroup v2, but system uses cgroup v1")
+		}
+	}
+
 	// Phase 3: 初始化状态存储
 	store, err := state.NewStore(rootDir)
 	if err != nil {
@@ -91,9 +130,10 @@ func runContainer(cmd *cobra.Command, args []string) error {
 		Command: args[0:1],
 		Args:    args[1:],
 		// Phase 1: 记录 `-t` 但不分配 PTY（见 docs/phase1-dev-notes.md）。
-		TTY:      tty,
-		Rootfs:   rootfs, // Phase 2 新增
-		Detached: detach, // Phase 3 新增
+		TTY:          tty,
+		Rootfs:       rootfs,       // Phase 2 新增
+		Detached:     detach,       // Phase 3 新增
+		CgroupConfig: cgroupConfig, // Phase 6 新增
 	}
 
 	// 生成容器 ID（64位十六进制，前12位用作默认主机名）
@@ -116,4 +156,111 @@ func runContainer(cmd *cobra.Command, args []string) error {
 
 	os.Exit(exitCode)
 	return nil // unreachable
+}
+
+// parseCgroupFlags 解析资源限制参数
+func parseCgroupFlags() (*cgroups.CgroupConfig, error) {
+	config := &cgroups.CgroupConfig{}
+
+	// 解析内存限制 (支持 k/m/g 后缀)
+	if memoryLimit != "" {
+		bytes, err := parseMemoryString(memoryLimit)
+		if err != nil {
+			return nil, fmt.Errorf("invalid memory limit: %w", err)
+		}
+		config.Memory = bytes
+	}
+
+	// 解析内存+交换空间限制
+	if memorySwap != "" {
+		if memorySwap == "-1" {
+			config.MemorySwap = -1
+		} else {
+			bytes, err := parseMemoryString(memorySwap)
+			if err != nil {
+				return nil, fmt.Errorf("invalid memory-swap limit: %w", err)
+			}
+			config.MemorySwap = bytes
+		}
+	}
+
+	// 解析 CPU 限制 (cpus -> quota)
+	if cpus != "" {
+		cpuFloat, err := strconv.ParseFloat(cpus, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid cpus value: %w", err)
+		}
+		if cpuFloat <= 0 {
+			return nil, fmt.Errorf("cpus must be positive")
+		}
+		// 转换为 quota: cpus * period
+		config.CPUPeriod = cpuPeriod
+		config.CPUQuota = int64(cpuFloat * float64(cpuPeriod))
+	} else if cpuQuota > 0 {
+		config.CPUQuota = cpuQuota
+		config.CPUPeriod = cpuPeriod
+	}
+
+	// 进程数限制
+	if pidsLimit > 0 {
+		config.PidsLimit = pidsLimit
+	}
+
+	return config, nil
+}
+
+// parseMemoryString 解析内存字符串（如 "512m" -> 536870912）
+// 支持 b, k, m, g 后缀（不区分大小写）
+func parseMemoryString(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty memory string")
+	}
+
+	// 获取数字部分和单位
+	s = strings.ToLower(s)
+	var multiplier int64 = 1
+	var numStr string
+
+	if strings.HasSuffix(s, "b") {
+		numStr = s[:len(s)-1]
+		multiplier = 1
+	} else if strings.HasSuffix(s, "k") || strings.HasSuffix(s, "kb") {
+		if strings.HasSuffix(s, "kb") {
+			numStr = s[:len(s)-2]
+		} else {
+			numStr = s[:len(s)-1]
+		}
+		multiplier = 1024
+	} else if strings.HasSuffix(s, "m") || strings.HasSuffix(s, "mb") {
+		if strings.HasSuffix(s, "mb") {
+			numStr = s[:len(s)-2]
+		} else {
+			numStr = s[:len(s)-1]
+		}
+		multiplier = 1024 * 1024
+	} else if strings.HasSuffix(s, "g") || strings.HasSuffix(s, "gb") {
+		if strings.HasSuffix(s, "gb") {
+			numStr = s[:len(s)-2]
+		} else {
+			numStr = s[:len(s)-1]
+		}
+		multiplier = 1024 * 1024 * 1024
+	} else {
+		// 纯数字，假设为字节
+		numStr = s
+	}
+
+	numStr = strings.TrimSpace(numStr)
+	num, err := strconv.ParseInt(numStr, 10, 64)
+	if err != nil {
+		// 尝试解析为浮点数（如 "1.5g"）
+		numFloat, err := strconv.ParseFloat(numStr, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid number: %s", numStr)
+		}
+		return int64(numFloat * float64(multiplier)), nil
+	}
+
+	return num * multiplier, nil
 }

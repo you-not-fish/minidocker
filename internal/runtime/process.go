@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"minidocker/internal/cgroups"
 	"minidocker/internal/state"
 	"minidocker/pkg/envutil"
 
@@ -47,6 +48,11 @@ func (l *logFiles) Close() {
 // - 支持后台模式（config.Detached）：立即返回，后台等待退出
 // - 日志重定向：stdout/stderr 写入日志文件
 //
+// Phase 6 更新：
+// - 集成 cgroup v2 资源限制
+// - 在启动进程前创建 cgroup，启动后将 PID 加入 cgroup
+// - 容器退出后清理 cgroup
+//
 // 注意：这个函数不应该调用 os.Exit。
 // 退出码应由 CLI（或后续阶段的 daemon/manager）统一处理。
 func Run(config *ContainerConfig, opts *RunOptions) (int, error) {
@@ -65,18 +71,50 @@ func Run(config *ContainerConfig, opts *RunOptions) (int, error) {
 		Detached: config.Detached,
 	}
 
+	// Phase 6: 添加 cgroup 配置到状态
+	if config.CgroupConfig != nil && !config.CgroupConfig.IsEmpty() {
+		stateConfig.Memory = config.CgroupConfig.Memory
+		stateConfig.MemorySwap = config.CgroupConfig.MemorySwap
+		stateConfig.CPUQuota = config.CgroupConfig.CPUQuota
+		stateConfig.CPUPeriod = config.CgroupConfig.CPUPeriod
+		stateConfig.PidsLimit = config.CgroupConfig.PidsLimit
+	}
+
 	containerState, err := opts.StateStore.Create(stateConfig)
 	if err != nil {
 		return -1, fmt.Errorf("failed to create container state: %w", err)
 	}
 
-	// 清理函数：启动失败时删除状态目录
+	// 清理函数：启动失败时删除状态目录和 cgroup
 	cleanupOnError := true
+	var cgroupPath string
+	var cgroupManager cgroups.Manager
 	defer func() {
 		if cleanupOnError {
+			// Phase 6: 清理 cgroup
+			if cgroupManager != nil && cgroupPath != "" {
+				_ = cgroupManager.Destroy(cgroupPath)
+			}
 			opts.StateStore.ForceDelete(config.ID)
 		}
 	}()
+
+	// Phase 6: 创建 cgroup（如果配置了资源限制）
+	if config.CgroupConfig != nil && !config.CgroupConfig.IsEmpty() {
+		var err error
+		cgroupManager, err = cgroups.NewManager()
+		if err != nil {
+			return -1, fmt.Errorf("failed to initialize cgroup manager: %w", err)
+		}
+
+		cgroupPath = cgroups.GetCgroupPath(config.ID)
+		if err := cgroupManager.Create(cgroupPath, config.CgroupConfig); err != nil {
+			return -1, fmt.Errorf("failed to create cgroup: %w", err)
+		}
+
+		// 更新状态中的 cgroup 路径
+		containerState.CgroupPath = cgroupPath
+	}
 
 	if config.Detached {
 		// 后台模式：启动 per-container shim 进程，并等待其将状态更新为 running。
@@ -109,6 +147,16 @@ func Run(config *ContainerConfig, opts *RunOptions) (int, error) {
 		return -1, fmt.Errorf("failed to start container process: %w", err)
 	}
 
+	// Phase 6: 将进程加入 cgroup
+	if cgroupManager != nil && cgroupPath != "" {
+		if err := cgroupManager.Apply(cgroupPath, cmd.Process.Pid); err != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			logs.Close()
+			return -1, fmt.Errorf("failed to apply cgroup: %w", err)
+		}
+	}
+
 	// 5. 更新状态为 running
 	if err := containerState.SetRunning(cmd.Process.Pid); err != nil {
 		// 启动成功但状态更新失败，尝试杀死进程
@@ -125,6 +173,11 @@ func Run(config *ContainerConfig, opts *RunOptions) (int, error) {
 	exitCode := waitForExit(cmd)
 	containerState.SetStopped(exitCode)
 	logs.Close()
+
+	// Phase 6: 前台模式下清理 cgroup
+	if cgroupManager != nil && cgroupPath != "" {
+		_ = cgroupManager.Destroy(cgroupPath)
+	}
 
 	return exitCode, nil
 }

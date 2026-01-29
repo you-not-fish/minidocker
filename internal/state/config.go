@@ -38,6 +38,22 @@ type ContainerConfig struct {
 	// 是否后台运行（Phase 3）
 	Detached bool `json:"detached"`
 
+	// --- Phase 6: cgroup 资源限制 ---
+	// 内存限制（字节）
+	Memory int64 `json:"memory,omitempty"`
+
+	// 内存+交换空间总限制（字节）
+	MemorySwap int64 `json:"memorySwap,omitempty"`
+
+	// CPU 配额（微秒/周期）
+	CPUQuota int64 `json:"cpuQuota,omitempty"`
+
+	// CPU 周期（微秒）
+	CPUPeriod int64 `json:"cpuPeriod,omitempty"`
+
+	// 进程数限制
+	PidsLimit int64 `json:"pidsLimit,omitempty"`
+
 	// --- Phase 11 预留字段（当前不实现）---
 	// Name 容器名称
 	// 在 Phase 11 实现完整的名称到 ID 的映射功能
@@ -101,4 +117,10 @@ func (c *ContainerConfig) GetCommand() []string {
 // ShortID 返回容器 ID 的前 12 个字符
 func (c *ContainerConfig) ShortID() string {
 	return idutil.ShortID(c.ID)
+}
+
+// HasCgroupConfig 检查是否配置了 cgroup 资源限制
+func (c *ContainerConfig) HasCgroupConfig() bool {
+	return c.Memory > 0 || c.MemorySwap != 0 ||
+		c.CPUQuota > 0 || c.PidsLimit > 0
 }

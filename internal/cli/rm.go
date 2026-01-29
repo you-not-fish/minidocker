@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"minidocker/internal/cgroups"
 	"minidocker/internal/state"
 
 	"github.com/spf13/cobra"
@@ -101,6 +102,15 @@ func removeContainer(store *state.Store, idOrPrefix string) error {
 				}
 				time.Sleep(100 * time.Millisecond)
 			}
+		}
+	}
+
+	// Phase 6: 清理 cgroup（如果存在）
+	// 需要在删除状态目录前清理，因为状态目录中存储了 cgroup 路径
+	if containerState.CgroupPath != "" {
+		if manager, err := cgroups.NewManager(); err == nil {
+			// 忽略清理错误（cgroup 可能已被清理）
+			_ = manager.Destroy(containerState.CgroupPath)
 		}
 	}
 

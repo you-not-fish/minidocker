@@ -45,6 +45,10 @@ type ContainerState struct {
 	FinishedAt *time.Time `json:"finishedAt,omitempty"`
 	ExitCode   *int       `json:"exitCode,omitempty"`
 
+	// Phase 6: cgroup 路径
+	// 格式: minidocker/<container-id>
+	CgroupPath string `json:"cgroupPath,omitempty"`
+
 	// 内部字段（不序列化）
 	containerDir string
 }
@@ -126,6 +130,7 @@ func (s *ContainerState) Reload() error {
 	s.StartedAt = newState.StartedAt
 	s.FinishedAt = newState.FinishedAt
 	s.ExitCode = newState.ExitCode
+	s.CgroupPath = newState.CgroupPath // Phase 6
 
 	return nil
 }

@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"minidocker/internal/cgroups"
 	"minidocker/pkg/idutil"
 )
 
@@ -47,11 +48,14 @@ type ContainerConfig struct {
 	// 在 Phase 11 实现完整的名称到 ID 映射功能
 	// Name string
 
+	// --- Phase 6: cgroup 资源限制 ---
+	// CgroupConfig 保存容器的资源限制配置（内存、CPU、进程数）
+	CgroupConfig *cgroups.CgroupConfig
+
 	// --- 用于未来扩展的占位符字段 ---
 	// 这些被注释掉是为了避免循环导入和未使用的代码警告。
 	// 在后续阶段根据需要取消注释并实现。
 	//
-	// CgroupConfig  *CgroupConfig  // 第6阶段：cgroup 资源限制
 	// NetworkConfig *NetworkConfig // 第7阶段：网络配置
 	// Mounts        []Mount        // 第10阶段：卷挂载
 }
