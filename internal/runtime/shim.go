@@ -10,19 +10,7 @@ import (
 	"strings"
 
 	"minidocker/internal/state"
-)
-
-const (
-	// shimEnvVar enables per-container shim mode.
-	// The shim is a long-running parent process for detached containers, responsible for:
-	// - starting the container init process
-	// - reaping it and capturing the exit code
-	// - updating state.json accordingly
-	shimEnvVar = "MINIDOCKER_SHIM"
-
-	// shimNotifyFdEnvVar specifies the fd number where the shim should write a single-line status:
-	// "OK" on success, or "ERR: <message>" on failure.
-	shimNotifyFdEnvVar = "MINIDOCKER_SHIM_NOTIFY_FD"
+	"minidocker/pkg/envutil"
 )
 
 // RunContainerShim is the entrypoint for the per-container shim process.
@@ -34,7 +22,7 @@ const (
 //
 // This aligns with the industry "per-container shim" model (e.g. containerd-shim).
 func RunContainerShim() {
-	containerDir := os.Getenv(statePathEnvVar)
+	containerDir := os.Getenv(envutil.StatePathEnvVar)
 	notify := openShimNotifyWriter()
 
 	fail := func(format string, args ...any) {
@@ -48,7 +36,7 @@ func RunContainerShim() {
 	}
 
 	if containerDir == "" {
-		fail("missing %s environment variable", statePathEnvVar)
+		fail("missing %s environment variable", envutil.StatePathEnvVar)
 	}
 
 	// Load config.json (immutable)
@@ -115,7 +103,7 @@ func RunContainerShim() {
 }
 
 func openShimNotifyWriter() *os.File {
-	fdStr := os.Getenv(shimNotifyFdEnvVar)
+	fdStr := os.Getenv(envutil.ShimNotifyFdEnvVar)
 	if strings.TrimSpace(fdStr) == "" {
 		return nil
 	}

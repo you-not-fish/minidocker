@@ -1,8 +1,7 @@
 package runtime
 
 import (
-	"crypto/rand"
-	"encoding/hex"
+	"minidocker/pkg/idutil"
 )
 
 // ContainerConfig 保存容器的配置。
@@ -60,22 +59,13 @@ type ContainerConfig struct {
 // GenerateContainerID 生成一个随机的64个字符的十六进制字符串。
 // 这遵循 Docker 的容器 ID 惯例。
 func GenerateContainerID() string {
-	bytes := make([]byte, 32)
-	if _, err := rand.Read(bytes); err != nil {
-		// 如果随机生成失败，回退到可预测的 ID。
-		// 这在实践中应该永远不会发生。
-		return "0000000000000000000000000000000000000000000000000000000000000000"
-	}
-	return hex.EncodeToString(bytes)
+	return idutil.GenerateID()
 }
 
 // ShortID 返回容器 ID 的前12个字符。
-// 这是 Docker 使用的标准“短 ID”格式。
+// 这是 Docker 使用的标准"短 ID"格式。
 func (c *ContainerConfig) ShortID() string {
-	if len(c.ID) >= 12 {
-		return c.ID[:12]
-	}
-	return c.ID
+	return idutil.ShortID(c.ID)
 }
 
 // GetHostname 返回容器的主机名。

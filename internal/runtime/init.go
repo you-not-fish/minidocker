@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"minidocker/internal/state"
+	"minidocker/pkg/envutil"
 
 	"golang.org/x/sys/unix"
 )
@@ -53,18 +54,18 @@ func RunContainerInit() {
 // Backward compatibility: if MINIDOCKER_CONFIG is present, it is still accepted.
 func getConfig() (*ContainerConfig, error) {
 	// Backward-compatible env JSON (Phase 1/2)
-	if configJSON := os.Getenv(configEnvVar); strings.TrimSpace(configJSON) != "" {
+	if configJSON := os.Getenv(envutil.ConfigEnvVar); strings.TrimSpace(configJSON) != "" {
 		var cfg ContainerConfig
 		if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
-			return nil, fmt.Errorf("failed to parse %s: %w", configEnvVar, err)
+			return nil, fmt.Errorf("failed to parse %s: %w", envutil.ConfigEnvVar, err)
 		}
 		return &cfg, nil
 	}
 
 	// Preferred: load config.json from bundle/container dir.
-	containerDir := os.Getenv(statePathEnvVar)
+	containerDir := os.Getenv(envutil.StatePathEnvVar)
 	if strings.TrimSpace(containerDir) == "" {
-		return nil, fmt.Errorf("missing %s environment variable", statePathEnvVar)
+		return nil, fmt.Errorf("missing %s environment variable", envutil.StatePathEnvVar)
 	}
 
 	cfg, err := state.LoadConfig(containerDir)
@@ -135,24 +136,8 @@ func runUserCommand(config *ContainerConfig) int {
 	cmd.Stderr = os.Stderr
 
 	// 设置环境（对于第11阶段，我们将在此添加自定义环境变量）
-	cmd.Env = os.Environ()
-
 	// 清除 MINIDOCKER_* 环境变量，以防泄露到容器中
-	var filteredEnv []string
-	for _, env := range cmd.Env {
-		if strings.HasPrefix(env, initEnvVar+"=") {
-			continue
-		}
-		if strings.HasPrefix(env, configEnvVar+"=") {
-			continue
-		}
-		// Phase 3 新增：过滤状态目录路径环境变量
-		if strings.HasPrefix(env, statePathEnvVar+"=") {
-			continue
-		}
-		filteredEnv = append(filteredEnv, env)
-	}
-	cmd.Env = filteredEnv
+	cmd.Env = envutil.FilterMinidockerEnv(os.Environ())
 
 	// 设置信号处理（并在其中启动用户命令）
 	// PID 1 必须能转发信号并回收僵尸进程

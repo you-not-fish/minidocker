@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"minidocker/pkg/fileutil"
 )
 
 // Status 表示容器状态
@@ -96,14 +98,8 @@ func (s *ContainerState) Save() error {
 	}
 
 	// 原子写入：先写临时文件，再重命名
-	tmpPath := statePath + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-		return fmt.Errorf("write state file: %w", err)
-	}
-
-	if err := os.Rename(tmpPath, statePath); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("rename state file: %w", err)
+	if err := fileutil.AtomicWriteFile(statePath, data, 0644); err != nil {
+		return fmt.Errorf("save state: %w", err)
 	}
 
 	return nil

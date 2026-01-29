@@ -8,6 +8,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"minidocker/pkg/fileutil"
+	"minidocker/pkg/idutil"
 )
 
 // ContainerConfig 是持久化的容器配置。
@@ -64,14 +67,8 @@ func (c *ContainerConfig) Save(containerDir string) error {
 	}
 
 	// 原子写入：先写临时文件，再重命名
-	tmpPath := configPath + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-		return fmt.Errorf("write config file: %w", err)
-	}
-
-	if err := os.Rename(tmpPath, configPath); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("rename config file: %w", err)
+	if err := fileutil.AtomicWriteFile(configPath, data, 0644); err != nil {
+		return fmt.Errorf("save config: %w", err)
 	}
 
 	return nil
@@ -103,8 +100,5 @@ func (c *ContainerConfig) GetCommand() []string {
 
 // ShortID 返回容器 ID 的前 12 个字符
 func (c *ContainerConfig) ShortID() string {
-	if len(c.ID) >= 12 {
-		return c.ID[:12]
-	}
-	return c.ID
+	return idutil.ShortID(c.ID)
 }

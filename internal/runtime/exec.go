@@ -10,17 +10,12 @@ import (
 	"os/exec"
 	"os/signal"
 	goruntime "runtime"
-	"strings"
 	"syscall"
+
+	"minidocker/pkg/envutil"
 
 	"golang.org/x/sys/unix"
 )
-
-// 用于触发 exec 模式的环境变量
-const execEnvVar = "MINIDOCKER_EXEC"
-
-// 用于传递 exec 配置的环境变量
-const execConfigEnvVar = "MINIDOCKER_EXEC_CONFIG"
 
 // ExecConfig 保存 exec 命令的配置
 type ExecConfig struct {
@@ -55,8 +50,8 @@ func Exec(config *ExecConfig) (int, error) {
 	// Re-exec 自身以加入命名空间
 	cmd := exec.Command("/proc/self/exe")
 	cmd.Env = append(os.Environ(),
-		execEnvVar+"=1",
-		execConfigEnvVar+"="+string(configJSON),
+		envutil.ExecEnvVar+"=1",
+		envutil.ExecConfigEnvVar+"="+string(configJSON),
 	)
 
 	// 处理 PTY 模式
@@ -90,7 +85,7 @@ func RunExecInit() {
 	// 为确保 joinNamespaces() 与后续 fork/exec 发生在同一线程上，必须锁线程。
 	goruntime.LockOSThread()
 
-	configJSON := os.Getenv(execConfigEnvVar)
+	configJSON := os.Getenv(envutil.ExecConfigEnvVar)
 	if configJSON == "" {
 		fmt.Fprintf(os.Stderr, "exec init: missing config\n")
 		os.Exit(1)
@@ -174,7 +169,7 @@ func runExecCommand(config *ExecConfig) int {
 	}
 
 	// 过滤 MINIDOCKER_* 环境变量
-	env := filterExecEnv(os.Environ())
+	env := envutil.FilterMinidockerEnv(os.Environ())
 
 	// 注意：PID namespace 通过 setns() 加入后，只对“后续创建的子进程”生效，
 	// 因此这里必须 fork/exec，而不能直接 syscall.Exec() 替换自身。
@@ -200,32 +195,3 @@ func runExecCommand(config *ExecConfig) int {
 	return 0
 }
 
-// filterExecEnv 移除 MINIDOCKER_* 环境变量
-func filterExecEnv(env []string) []string {
-	var filtered []string
-	for _, e := range env {
-		if !isExecMinidockerEnv(e) {
-			filtered = append(filtered, e)
-		}
-	}
-	return filtered
-}
-
-// isExecMinidockerEnv 检查环境变量是否是 MINIDOCKER_* 变量
-func isExecMinidockerEnv(env string) bool {
-	prefixes := []string{
-		execEnvVar + "=",
-		execConfigEnvVar + "=",
-		initEnvVar + "=",
-		configEnvVar + "=",
-		statePathEnvVar + "=",
-		shimEnvVar + "=",
-		shimNotifyFdEnvVar + "=",
-	}
-	for _, prefix := range prefixes {
-		if strings.HasPrefix(env, prefix) {
-			return true
-		}
-	}
-	return false
-}

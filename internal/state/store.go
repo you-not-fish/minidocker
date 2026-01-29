@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"minidocker/pkg/idutil"
 )
 
 // 默认状态根目录
@@ -160,11 +162,7 @@ func (s *Store) Delete(containerID string) error {
 	// 加载状态检查是否运行中
 	state, err := LoadState(containerDir)
 	if err == nil && state.IsRunning() {
-		shortID := containerID
-		if len(shortID) > 12 {
-			shortID = shortID[:12]
-		}
-		return fmt.Errorf("container %s is running, stop it first or use force", shortID)
+		return fmt.Errorf("container %s is running, stop it first or use force", idutil.ShortID(containerID))
 	}
 
 	// 删除目录
@@ -187,12 +185,12 @@ func (s *Store) Exists(containerID string) bool {
 // 如果有多个匹配，返回错误。
 func (s *Store) LookupID(idOrPrefix string) (string, error) {
 	// 短 ID 至少需要 3 个字符
-	if len(idOrPrefix) < 3 {
-		return "", fmt.Errorf("container ID prefix must be at least 3 characters")
+	if err := idutil.ValidatePrefix(idOrPrefix); err != nil {
+		return "", err
 	}
 
 	// 如果是完整 ID（64 字符），直接返回
-	if len(idOrPrefix) == 64 {
+	if idutil.IsFullID(idOrPrefix) {
 		if s.Exists(idOrPrefix) {
 			return idOrPrefix, nil
 		}
@@ -246,12 +244,4 @@ func (s *Store) ForceDelete(containerID string) error {
 	}
 
 	return nil
-}
-
-// min 返回两个整数的最小值
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

@@ -14,18 +14,10 @@ import (
 	"time"
 
 	"minidocker/internal/state"
+	"minidocker/pkg/envutil"
 
 	"golang.org/x/sys/unix"
 )
-
-// 用于触发 init 模式的环境变量
-const initEnvVar = "MINIDOCKER_INIT"
-
-// 用于将容器配置传递给 init 进程的环境变量
-const configEnvVar = "MINIDOCKER_CONFIG"
-
-// 用于将状态目录路径传递给 init 进程的环境变量
-const statePathEnvVar = "MINIDOCKER_STATE_PATH"
 
 // RunOptions 配置容器运行方式
 type RunOptions struct {
@@ -159,9 +151,9 @@ func startDetachedShim(containerDir string) error {
 
 	// Pass container directory + notify fd.
 	shimCmd.Env = append(os.Environ(),
-		shimEnvVar+"=1",
-		statePathEnvVar+"="+containerDir,
-		shimNotifyFdEnvVar+"=3",
+		envutil.ShimEnvVar+"=1",
+		envutil.StatePathEnvVar+"="+containerDir,
+		envutil.ShimNotifyFdEnvVar+"=3",
 	)
 	shimCmd.ExtraFiles = []*os.File{notifyW} // fd=3 in child
 
@@ -282,8 +274,8 @@ func newParentProcess(config *ContainerConfig, containerDir string, logs *logFil
 
 	// 为 init 进程设置环境
 	cmd.Env = append(os.Environ(),
-		initEnvVar+"=1",
-		statePathEnvVar+"="+containerDir,
+		envutil.InitEnvVar+"=1",
+		envutil.StatePathEnvVar+"="+containerDir,
 	)
 
 	// 设置标准输入输出
