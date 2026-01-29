@@ -16,8 +16,8 @@ package cgroups
 
 import (
 	"os"
-	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 // CgroupConfig 定义容器的资源限制配置。
@@ -29,10 +29,14 @@ type CgroupConfig struct {
 	Memory int64 `json:"memory,omitempty"`
 
 	// MemorySwap 内存+交换空间总限制（字节）
-	// 对应 memory.swap.max
-	// -1 表示不限制交换空间（memory.swap.max = "max"）
-	// 0 表示与 Memory 相同（禁用额外交换空间）
-	// > 0 表示具体限制
+	// 语义对齐 Docker 的 --memory-swap（total = memory + swap）。
+	//
+	// 注意：cgroup v2 中真正写入的是 memory.swap.max（swap 上限），因此实现会换算：
+	//   swap.max = MemorySwap - Memory
+	//
+	// -1 表示不限制 swap（memory.swap.max = "max"）
+	// 0 表示不设置 swap 限制
+	// > 0 表示 memory+swap 总上限
 	MemorySwap int64 `json:"memorySwap,omitempty"`
 
 	// CPUQuota CPU 配额（微秒/周期）
@@ -131,7 +135,6 @@ func readInt64(path string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	// 去除换行符
-	data = filepath.Clean(data)
+	data = strings.TrimSpace(data)
 	return strconv.ParseInt(data, 10, 64)
 }

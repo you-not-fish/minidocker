@@ -5,6 +5,7 @@ package cli
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -168,11 +169,21 @@ func parseCgroupFlags() (*cgroups.CgroupConfig, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid memory limit: %w", err)
 		}
+		if bytes < 0 {
+			return nil, fmt.Errorf("memory must be non-negative")
+		}
 		config.Memory = bytes
 	}
 
 	// 解析内存+交换空间限制
 	if memorySwap != "" {
+		// 语义对齐 Docker：
+		// - --memory-swap 表示 memory+swap 的总上限
+		// - 需要同时设置 --memory（否则语义不清晰，也无法换算 swap.max）
+		if config.Memory == 0 {
+			return nil, fmt.Errorf("memory-swap requires --memory to be set")
+		}
+
 		if memorySwap == "-1" {
 			config.MemorySwap = -1
 		} else {
@@ -180,12 +191,31 @@ func parseCgroupFlags() (*cgroups.CgroupConfig, error) {
 			if err != nil {
 				return nil, fmt.Errorf("invalid memory-swap limit: %w", err)
 			}
+			if bytes <= 0 {
+				return nil, fmt.Errorf("memory-swap must be -1 or a positive value")
+			}
+			if bytes < config.Memory {
+				return nil, fmt.Errorf("memory-swap must be >= memory (got memory=%d, memory-swap=%d)", config.Memory, bytes)
+			}
 			config.MemorySwap = bytes
 		}
 	}
 
 	// 解析 CPU 限制 (cpus -> quota)
+	// cgroup v2 cpu.max period 有效范围: 1000-1000000 微秒 (1ms - 1s)
+	const (
+		minCPUPeriod = 1000
+		maxCPUPeriod = 1000000
+	)
+	if cpuPeriod < minCPUPeriod || cpuPeriod > maxCPUPeriod {
+		return nil, fmt.Errorf("cpu-period must be between %d and %d (got %d)", minCPUPeriod, maxCPUPeriod, cpuPeriod)
+	}
+
 	if cpus != "" {
+		if cpuQuota > 0 {
+			return nil, fmt.Errorf("cannot set both --cpus and --cpu-quota")
+		}
+
 		cpuFloat, err := strconv.ParseFloat(cpus, 64)
 		if err != nil {
 			return nil, fmt.Errorf("invalid cpus value: %w", err)
@@ -196,12 +226,18 @@ func parseCgroupFlags() (*cgroups.CgroupConfig, error) {
 		// 转换为 quota: cpus * period
 		config.CPUPeriod = cpuPeriod
 		config.CPUQuota = int64(cpuFloat * float64(cpuPeriod))
+		if config.CPUQuota <= 0 {
+			return nil, fmt.Errorf("cpus too small (computed quota=%d)", config.CPUQuota)
+		}
 	} else if cpuQuota > 0 {
 		config.CPUQuota = cpuQuota
 		config.CPUPeriod = cpuPeriod
 	}
 
 	// 进程数限制
+	if pidsLimit < 0 {
+		return nil, fmt.Errorf("pids-limit must be non-negative")
+	}
 	if pidsLimit > 0 {
 		config.PidsLimit = pidsLimit
 	}
@@ -210,57 +246,64 @@ func parseCgroupFlags() (*cgroups.CgroupConfig, error) {
 }
 
 // parseMemoryString 解析内存字符串（如 "512m" -> 536870912）
-// 支持 b, k, m, g 后缀（不区分大小写）
+// 支持 b/k/kb/m/mb/g/gb 后缀（不区分大小写），数字部分可为整数或小数（如 1.5g）。
 func parseMemoryString(s string) (int64, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return 0, fmt.Errorf("empty memory string")
 	}
 
-	// 获取数字部分和单位
 	s = strings.ToLower(s)
-	var multiplier int64 = 1
-	var numStr string
 
-	if strings.HasSuffix(s, "b") {
-		numStr = s[:len(s)-1]
-		multiplier = 1
-	} else if strings.HasSuffix(s, "k") || strings.HasSuffix(s, "kb") {
-		if strings.HasSuffix(s, "kb") {
-			numStr = s[:len(s)-2]
-		} else {
-			numStr = s[:len(s)-1]
-		}
+	var multiplier int64 = 1
+	numStr := s
+
+	// 注意：必须先匹配 "kb/mb/gb"，否则会被末尾的 "b" 分支抢先匹配
+	switch {
+	case strings.HasSuffix(s, "kb"):
 		multiplier = 1024
-	} else if strings.HasSuffix(s, "m") || strings.HasSuffix(s, "mb") {
-		if strings.HasSuffix(s, "mb") {
-			numStr = s[:len(s)-2]
-		} else {
-			numStr = s[:len(s)-1]
-		}
+		numStr = s[:len(s)-2]
+	case strings.HasSuffix(s, "k"):
+		multiplier = 1024
+		numStr = s[:len(s)-1]
+	case strings.HasSuffix(s, "mb"):
 		multiplier = 1024 * 1024
-	} else if strings.HasSuffix(s, "g") || strings.HasSuffix(s, "gb") {
-		if strings.HasSuffix(s, "gb") {
-			numStr = s[:len(s)-2]
-		} else {
-			numStr = s[:len(s)-1]
-		}
+		numStr = s[:len(s)-2]
+	case strings.HasSuffix(s, "m"):
+		multiplier = 1024 * 1024
+		numStr = s[:len(s)-1]
+	case strings.HasSuffix(s, "gb"):
 		multiplier = 1024 * 1024 * 1024
-	} else {
+		numStr = s[:len(s)-2]
+	case strings.HasSuffix(s, "g"):
+		multiplier = 1024 * 1024 * 1024
+		numStr = s[:len(s)-1]
+	case strings.HasSuffix(s, "b"):
+		multiplier = 1
+		numStr = s[:len(s)-1]
+	default:
 		// 纯数字，假设为字节
+		multiplier = 1
 		numStr = s
 	}
 
 	numStr = strings.TrimSpace(numStr)
-	num, err := strconv.ParseInt(numStr, 10, 64)
-	if err != nil {
-		// 尝试解析为浮点数（如 "1.5g"）
-		numFloat, err := strconv.ParseFloat(numStr, 64)
-		if err != nil {
-			return 0, fmt.Errorf("invalid number: %s", numStr)
-		}
-		return int64(numFloat * float64(multiplier)), nil
+	if numStr == "" {
+		return 0, fmt.Errorf("missing number")
 	}
 
-	return num * multiplier, nil
+	num, err := strconv.ParseFloat(numStr, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid number: %s", numStr)
+	}
+	if num < 0 {
+		return 0, fmt.Errorf("memory value must be non-negative")
+	}
+
+	// overflow guard
+	if num > float64(math.MaxInt64)/float64(multiplier) {
+		return 0, fmt.Errorf("memory value too large")
+	}
+
+	return int64(num * float64(multiplier)), nil
 }

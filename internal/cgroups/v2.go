@@ -39,6 +39,11 @@ func (m *V2Manager) Create(cgroupPath string, config *CgroupConfig) error {
 		}
 	}
 
+	// 基于配置检查所需控制器是否存在（在 root cgroup 维度检查）
+	if err := CheckRequiredControllers(m.root, config); err != nil {
+		return err
+	}
+
 	// 确保父目录存在并启用子树控制器
 	parentPath := filepath.Dir(fullPath)
 	if err := m.ensureParentControllers(parentPath, config); err != nil {
@@ -90,41 +95,45 @@ func (m *V2Manager) ensureParentControllers(parentPath string, config *CgroupCon
 		return nil
 	}
 
-	// 从根到父目录逐级启用控制器
-	// 需要从 cgroup root 开始逐级启用
+	// 从 root 到 parentPath 逐级启用控制器（关键：必须包含 parentPath 本身）
 	rel, err := filepath.Rel(m.root, parentPath)
 	if err != nil {
 		return fmt.Errorf("get relative path: %w", err)
 	}
 
-	parts := strings.Split(rel, string(filepath.Separator))
-	currentPath := m.root
+	paths := []string{m.root}
+	if rel != "." {
+		currentPath := m.root
+		for _, part := range strings.Split(rel, string(filepath.Separator)) {
+			if part == "" || part == "." {
+				continue
+			}
+			currentPath = filepath.Join(currentPath, part)
+			paths = append(paths, currentPath)
+		}
+	}
 
-	for _, part := range parts {
-		if part == "" || part == "." {
-			continue
+	for _, p := range paths {
+		subtreeControlPath := filepath.Join(p, "cgroup.subtree_control")
+
+		data, err := os.ReadFile(subtreeControlPath)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", subtreeControlPath, err)
 		}
 
-		// 在当前路径启用子树控制器
-		subtreeControlPath := filepath.Join(currentPath, "cgroup.subtree_control")
-
-		// 读取当前已启用的控制器
 		enabled := make(map[string]bool)
-		if data, err := os.ReadFile(subtreeControlPath); err == nil {
-			for _, c := range strings.Fields(string(data)) {
-				enabled[c] = true
-			}
+		for _, c := range strings.Fields(string(data)) {
+			enabled[c] = true
 		}
 
-		// 启用缺失的控制器
 		for _, c := range controllers {
-			if !enabled[c] {
-				// 尝试启用控制器（可能因为父级未启用而失败，忽略错误）
-				_ = writeFile(subtreeControlPath, "+"+c)
+			if enabled[c] {
+				continue
+			}
+			if err := writeFile(subtreeControlPath, "+"+c); err != nil {
+				return fmt.Errorf("enable controller %q in %s: %w", c, subtreeControlPath, err)
 			}
 		}
-
-		currentPath = filepath.Join(currentPath, part)
 	}
 
 	return nil
@@ -150,21 +159,18 @@ func (m *V2Manager) applyConfig(cgroupPath string, config *CgroupConfig) error {
 		var value string
 		if config.MemorySwap == -1 {
 			value = "max"
-		} else if config.MemorySwap == 0 {
-			// 0 表示禁用交换空间
-			value = "0"
 		} else {
-			// 具体值：交换空间限制 = MemorySwap - Memory
+			// 语义：MemorySwap 是 memory+swap 总上限（对齐 Docker）
+			// cgroup v2 需要写入的是 swap 上限：swap.max = total - memory
 			swapLimit := config.MemorySwap - config.Memory
 			if swapLimit < 0 {
-				swapLimit = 0
+				return fmt.Errorf("invalid memory-swap (%d) < memory (%d)", config.MemorySwap, config.Memory)
 			}
 			value = strconv.FormatInt(swapLimit, 10)
 		}
 		if err := writeFile(memorySwapMaxPath, value); err != nil {
-			// 交换空间限制可能不可用（例如未启用 swap 或不支持）
-			// 记录警告但不失败
-			// TODO: 添加日志
+			// 用户显式设置了 swap limit，但系统可能不支持（例如未启用 swap controller 或内核未开启 swap accounting）。
+			return fmt.Errorf("set memory.swap.max: %w", err)
 		}
 	}
 

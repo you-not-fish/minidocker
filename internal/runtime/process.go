@@ -99,7 +99,19 @@ func Run(config *ContainerConfig, opts *RunOptions) (int, error) {
 		}
 	}()
 
-	// Phase 6: 创建 cgroup（如果配置了资源限制）
+	if config.Detached {
+		// 后台模式：启动 per-container shim 进程，并等待其将状态更新为 running。
+		// run -d 必须立即返回，但 exitCode/state 的最终更新需要一个持久的父进程（类似 containerd-shim）。
+		if err := startDetachedShim(containerState.GetContainerDir()); err != nil {
+			return -1, fmt.Errorf("failed to start container shim: %w", err)
+		}
+
+		// 启动成功，取消清理
+		cleanupOnError = false
+		return 0, nil
+	}
+
+	// Phase 6: 前台模式创建 cgroup（后台模式由 shim 负责创建/加入/清理）
 	if config.CgroupConfig != nil && !config.CgroupConfig.IsEmpty() {
 		var err error
 		cgroupManager, err = cgroups.NewManager()
@@ -112,20 +124,8 @@ func Run(config *ContainerConfig, opts *RunOptions) (int, error) {
 			return -1, fmt.Errorf("failed to create cgroup: %w", err)
 		}
 
-		// 更新状态中的 cgroup 路径
+		// 更新状态中的 cgroup 路径（随 SetRunning/Save 一并持久化）
 		containerState.CgroupPath = cgroupPath
-	}
-
-	if config.Detached {
-		// 后台模式：启动 per-container shim 进程，并等待其将状态更新为 running。
-		// run -d 必须立即返回，但 exitCode/state 的最终更新需要一个持久的父进程（类似 containerd-shim）。
-		if err := startDetachedShim(containerState.GetContainerDir()); err != nil {
-			return -1, fmt.Errorf("failed to start container shim: %w", err)
-		}
-
-		// 启动成功，取消清理
-		cleanupOnError = false
-		return 0, nil
 	}
 
 	// 2. 设置日志文件（前台模式）

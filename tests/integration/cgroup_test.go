@@ -4,6 +4,7 @@
 package integration
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,9 +29,72 @@ func skipIfNotCgroupV2(t *testing.T) {
 	}
 }
 
+func hasController(t *testing.T, controller string) bool {
+	data, err := os.ReadFile("/sys/fs/cgroup/cgroup.controllers")
+	if err != nil {
+		t.Fatalf("Failed to read cgroup.controllers: %v", err)
+	}
+	for _, c := range strings.Fields(string(data)) {
+		if c == controller {
+			return true
+		}
+	}
+	return false
+}
+
+func skipIfControllerMissing(t *testing.T, controller string) {
+	if !hasController(t, controller) {
+		t.Skipf("controller %q not available in cgroup.controllers", controller)
+	}
+}
+
+func readCgroupFile(t *testing.T, containerID, filename string) string {
+	t.Helper()
+	p := filepath.Join("/sys/fs/cgroup", "minidocker", containerID, filename)
+	data, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("Failed to read %s: %v", p, err)
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func cleanupContainer(t *testing.T, stateRoot, containerID string) {
+	t.Helper()
+	_ = exec.Command(minidockerBin, "--root", stateRoot, "kill", containerID).Run()
+	_ = exec.Command(minidockerBin, "--root", stateRoot, "rm", "-f", containerID).Run()
+}
+
+func waitForGone(path string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("path still exists after %s: %s", timeout, path)
+}
+
+func findSingleContainerID(t *testing.T, stateRoot string) string {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(stateRoot, "containers"))
+	if err != nil {
+		t.Fatalf("Failed to read containers directory: %v", err)
+	}
+	if len(entries) != 1 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("Expected exactly 1 container directory, got %d: %v", len(entries), names)
+	}
+	return entries[0].Name()
+}
+
 // TestCgroupV2Available 检测 cgroup v2 是否可用
 func TestCgroupV2Available(t *testing.T) {
 	skipIfNotRoot(t)
+	skipIfNotCgroupV2(t)
 
 	// 检查 cgroup v2 统一层级
 	if _, err := os.Stat("/sys/fs/cgroup/cgroup.controllers"); os.IsNotExist(err) {
@@ -65,22 +129,28 @@ func TestCgroupV2Available(t *testing.T) {
 func TestMemoryLimit(t *testing.T) {
 	skipIfNotRoot(t)
 	skipIfNotCgroupV2(t)
+	skipIfControllerMissing(t, "memory")
 
 	rootfs := prepareMinimalRootfs(t)
 	defer os.RemoveAll(rootfs)
 
-	// 运行容器并检查 memory.max 是否正确设置
-	cmd := exec.Command(minidockerBin, "run",
+	stateRoot := t.TempDir()
+
+	// 使用后台模式保持 cgroup 存在，便于从宿主侧读取限制配置
+	cmd := exec.Command(minidockerBin, "--root", stateRoot, "run",
+		"-d",
 		"-m", "64m",
 		"--rootfs", rootfs,
-		"/bin/sh", "-c", "cat /sys/fs/cgroup/memory.max")
+		"/bin/sleep", "10")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("minidocker run failed: %v\nOutput: %s", err, output)
 	}
 
-	// 验证 memory.max 值
-	memoryMax := strings.TrimSpace(string(output))
+	containerID := strings.TrimSpace(string(output))
+	t.Cleanup(func() { cleanupContainer(t, stateRoot, containerID) })
+
+	memoryMax := readCgroupFile(t, containerID, "memory.max")
 	expected := strconv.FormatInt(64*1024*1024, 10) // 64MB in bytes
 	if memoryMax != expected {
 		t.Errorf("Expected memory.max=%s, got=%s", expected, memoryMax)
@@ -91,23 +161,27 @@ func TestMemoryLimit(t *testing.T) {
 func TestCPULimit(t *testing.T) {
 	skipIfNotRoot(t)
 	skipIfNotCgroupV2(t)
+	skipIfControllerMissing(t, "cpu")
 
 	rootfs := prepareMinimalRootfs(t)
 	defer os.RemoveAll(rootfs)
 
-	// 运行容器并检查 cpu.max 是否正确设置
-	cmd := exec.Command(minidockerBin, "run",
+	stateRoot := t.TempDir()
+
+	cmd := exec.Command(minidockerBin, "--root", stateRoot, "run",
+		"-d",
 		"--cpus", "0.5",
 		"--rootfs", rootfs,
-		"/bin/sh", "-c", "cat /sys/fs/cgroup/cpu.max")
+		"/bin/sleep", "10")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("minidocker run failed: %v\nOutput: %s", err, output)
 	}
 
-	// 验证 cpu.max 值
-	// 格式: "quota period"
-	cpuMax := strings.TrimSpace(string(output))
+	containerID := strings.TrimSpace(string(output))
+	t.Cleanup(func() { cleanupContainer(t, stateRoot, containerID) })
+
+	cpuMax := readCgroupFile(t, containerID, "cpu.max")
 	parts := strings.Fields(cpuMax)
 	if len(parts) != 2 {
 		t.Fatalf("Unexpected cpu.max format: %s", cpuMax)
@@ -130,22 +204,27 @@ func TestCPULimit(t *testing.T) {
 func TestPidsLimit(t *testing.T) {
 	skipIfNotRoot(t)
 	skipIfNotCgroupV2(t)
+	skipIfControllerMissing(t, "pids")
 
 	rootfs := prepareMinimalRootfs(t)
 	defer os.RemoveAll(rootfs)
 
-	// 运行容器并检查 pids.max 是否正确设置
-	cmd := exec.Command(minidockerBin, "run",
+	stateRoot := t.TempDir()
+
+	cmd := exec.Command(minidockerBin, "--root", stateRoot, "run",
+		"-d",
 		"--pids-limit", "10",
 		"--rootfs", rootfs,
-		"/bin/sh", "-c", "cat /sys/fs/cgroup/pids.max")
+		"/bin/sleep", "10")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("minidocker run failed: %v\nOutput: %s", err, output)
 	}
 
-	// 验证 pids.max 值
-	pidsMax := strings.TrimSpace(string(output))
+	containerID := strings.TrimSpace(string(output))
+	t.Cleanup(func() { cleanupContainer(t, stateRoot, containerID) })
+
+	pidsMax := readCgroupFile(t, containerID, "pids.max")
 	if pidsMax != "10" {
 		t.Errorf("Expected pids.max=10, got=%s", pidsMax)
 	}
@@ -155,42 +234,72 @@ func TestPidsLimit(t *testing.T) {
 func TestPidsLimitEnforcement(t *testing.T) {
 	skipIfNotRoot(t)
 	skipIfNotCgroupV2(t)
+	skipIfControllerMissing(t, "pids")
 
 	rootfs := prepareMinimalRootfs(t)
 	defer os.RemoveAll(rootfs)
 
-	// 设置 pids 限制为 5，尝试创建更多进程
-	// 注意：shell 本身和 sleep 命令会占用一些进程配额
-	cmd := exec.Command(minidockerBin, "run",
+	stateRoot := t.TempDir()
+
+	// 设置 pids 限制为 5，尝试在容器内 fork 更多进程，并通过宿主侧读取 pids.events 验证发生过触顶事件。
+	script := `
+set +e
+i=0
+while [ "$i" -lt 20 ]; do
+  sleep 10 &
+  i=$((i+1))
+done
+sleep 10
+`
+	cmd := exec.Command(minidockerBin, "--root", stateRoot, "run",
+		"-d",
 		"--pids-limit", "5",
 		"--rootfs", rootfs,
-		"/bin/sh", "-c", `
-for i in 1 2 3 4 5 6 7 8 9 10; do
-    sleep 0.1 &
-done 2>/dev/null
-wait 2>/dev/null
-echo "done"
-`)
-	output, _ := cmd.CombinedOutput()
+		"/bin/sh", "-c", script)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("minidocker run -d failed: %v\nOutput: %s", err, output)
+	}
 
-	// 只要命令完成且输出 "done" 就认为测试通过
-	// 实际的 fork 限制会导致部分 sleep 启动失败，但不会导致整个脚本崩溃
-	if !strings.Contains(string(output), "done") {
-		t.Logf("Output: %s", output)
-		t.Errorf("Expected 'done' in output (pids limit may have caused failures)")
+	containerID := strings.TrimSpace(string(output))
+	t.Cleanup(func() { cleanupContainer(t, stateRoot, containerID) })
+
+	// 给容器一点时间尝试 fork
+	time.Sleep(300 * time.Millisecond)
+
+	events := readCgroupFile(t, containerID, "pids.events")
+	var maxEvents int64 = -1
+	for _, line := range strings.Split(events, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) == 2 && fields[0] == "max" {
+			v, parseErr := strconv.ParseInt(fields[1], 10, 64)
+			if parseErr == nil {
+				maxEvents = v
+			}
+			break
+		}
+	}
+	if maxEvents < 0 {
+		t.Fatalf("Unexpected pids.events format: %q", events)
+	}
+	if maxEvents == 0 {
+		t.Fatalf("Expected pids.events max > 0 (limit enforcement), got 0. pids.events:\n%s", events)
 	}
 }
 
-// TestCgroupCleanup 测试 cgroup 清理
+// TestCgroupCleanup 测试前台模式下 cgroup 会在容器退出后被清理
 func TestCgroupCleanup(t *testing.T) {
 	skipIfNotRoot(t)
 	skipIfNotCgroupV2(t)
+	skipIfControllerMissing(t, "memory")
 
 	rootfs := prepareMinimalRootfs(t)
 	defer os.RemoveAll(rootfs)
 
-	// 运行带资源限制的容器（前台模式，会立即退出）
-	cmd := exec.Command(minidockerBin, "run",
+	stateRoot := t.TempDir()
+
+	// 前台运行带资源限制的容器（会立即退出）
+	cmd := exec.Command(minidockerBin, "--root", stateRoot, "run",
 		"-m", "64m",
 		"--rootfs", rootfs,
 		"/bin/echo", "hello")
@@ -199,17 +308,13 @@ func TestCgroupCleanup(t *testing.T) {
 		t.Fatalf("minidocker run failed: %v\nOutput: %s", err, output)
 	}
 
-	// 等待一小段时间确保清理完成
-	time.Sleep(100 * time.Millisecond)
+	containerID := findSingleContainerID(t, stateRoot)
+	t.Cleanup(func() { cleanupContainer(t, stateRoot, containerID) })
 
-	// 检查 minidocker cgroup 目录
-	// 前台模式下，容器退出后 cgroup 应该被清理
-	minidockerCgroupDir := "/sys/fs/cgroup/minidocker"
-	entries, err := os.ReadDir(minidockerCgroupDir)
-	if err == nil && len(entries) > 0 {
-		// 可能有其他容器的 cgroup，但数量应该很少
-		t.Logf("Warning: found %d cgroup entries in %s (may be from other containers)",
-			len(entries), minidockerCgroupDir)
+	// 容器退出后 cgroup 目录应被删除
+	cgroupDir := filepath.Join("/sys/fs/cgroup/minidocker", containerID)
+	if err := waitForGone(cgroupDir, 2*time.Second); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -217,12 +322,15 @@ func TestCgroupCleanup(t *testing.T) {
 func TestDetachedCgroupCleanup(t *testing.T) {
 	skipIfNotRoot(t)
 	skipIfNotCgroupV2(t)
+	skipIfControllerMissing(t, "memory")
 
 	rootfs := prepareMinimalRootfs(t)
 	defer os.RemoveAll(rootfs)
 
+	stateRoot := t.TempDir()
+
 	// 运行后台容器
-	cmd := exec.Command(minidockerBin, "run",
+	cmd := exec.Command(minidockerBin, "--root", stateRoot, "run",
 		"-d",
 		"-m", "64m",
 		"--rootfs", rootfs,
@@ -236,6 +344,7 @@ func TestDetachedCgroupCleanup(t *testing.T) {
 	if len(containerID) != 64 {
 		t.Fatalf("Invalid container ID: %s", containerID)
 	}
+	t.Cleanup(func() { cleanupContainer(t, stateRoot, containerID) })
 
 	// 检查 cgroup 目录是否创建
 	cgroupPath := filepath.Join("/sys/fs/cgroup/minidocker", containerID)
@@ -250,55 +359,51 @@ func TestDetachedCgroupCleanup(t *testing.T) {
 	if _, err := os.Stat(cgroupPath); !os.IsNotExist(err) {
 		t.Errorf("Cgroup directory should be removed after container exit: %s", cgroupPath)
 	}
-
-	// 清理容器
-	cleanupCmd := exec.Command(minidockerBin, "rm", containerID)
-	_ = cleanupCmd.Run()
 }
 
 // TestCombinedLimits 测试组合资源限制
 func TestCombinedLimits(t *testing.T) {
 	skipIfNotRoot(t)
 	skipIfNotCgroupV2(t)
+	skipIfControllerMissing(t, "memory")
+	skipIfControllerMissing(t, "cpu")
+	skipIfControllerMissing(t, "pids")
 
 	rootfs := prepareMinimalRootfs(t)
 	defer os.RemoveAll(rootfs)
 
-	// 运行容器并检查多个资源限制
-	cmd := exec.Command(minidockerBin, "run",
+	stateRoot := t.TempDir()
+
+	cmd := exec.Command(minidockerBin, "--root", stateRoot, "run",
+		"-d",
 		"-m", "128m",
 		"--cpus", "1",
 		"--pids-limit", "50",
 		"--rootfs", rootfs,
-		"/bin/sh", "-c", `
-echo "memory.max=$(cat /sys/fs/cgroup/memory.max)"
-echo "cpu.max=$(cat /sys/fs/cgroup/cpu.max)"
-echo "pids.max=$(cat /sys/fs/cgroup/pids.max)"
-`)
+		"/bin/sleep", "10")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("minidocker run failed: %v\nOutput: %s", err, output)
 	}
 
-	outputStr := string(output)
+	containerID := strings.TrimSpace(string(output))
+	t.Cleanup(func() { cleanupContainer(t, stateRoot, containerID) })
 
 	// 验证内存限制
-	expectedMemory := strconv.FormatInt(128*1024*1024, 10)
-	if !strings.Contains(outputStr, "memory.max="+expectedMemory) {
-		t.Errorf("Expected memory.max=%s in output", expectedMemory)
+	expectedMemory := strconv.FormatInt(128*1024*1024, 10) // 128MB
+	if got := readCgroupFile(t, containerID, "memory.max"); got != expectedMemory {
+		t.Errorf("Expected memory.max=%s, got=%s", expectedMemory, got)
 	}
 
 	// 验证 CPU 限制
-	if !strings.Contains(outputStr, "cpu.max=100000 100000") {
-		t.Errorf("Expected cpu.max=100000 100000 in output")
+	if got := readCgroupFile(t, containerID, "cpu.max"); strings.TrimSpace(got) != "100000 100000" {
+		t.Errorf("Expected cpu.max=100000 100000, got=%s", got)
 	}
 
 	// 验证进程数限制
-	if !strings.Contains(outputStr, "pids.max=50") {
-		t.Errorf("Expected pids.max=50 in output")
+	if got := readCgroupFile(t, containerID, "pids.max"); strings.TrimSpace(got) != "50" {
+		t.Errorf("Expected pids.max=50, got=%s", got)
 	}
-
-	t.Logf("Output:\n%s", outputStr)
 }
 
 // TestNoCgroupWithoutLimits 测试无资源限制时不创建 cgroup
@@ -309,26 +414,24 @@ func TestNoCgroupWithoutLimits(t *testing.T) {
 	rootfs := prepareMinimalRootfs(t)
 	defer os.RemoveAll(rootfs)
 
-	// 运行不带资源限制的容器
-	// 此时不应该创建 cgroup
-	cmd := exec.Command(minidockerBin, "run",
+	stateRoot := t.TempDir()
+
+	// 运行不带资源限制的后台容器：此时不应该创建 /sys/fs/cgroup/minidocker/<id>
+	cmd := exec.Command(minidockerBin, "--root", stateRoot, "run",
+		"-d",
 		"--rootfs", rootfs,
-		"/bin/sh", "-c", `
-# 检查是否在 minidocker cgroup 中
-cgroup=$(cat /proc/self/cgroup)
-if echo "$cgroup" | grep -q "minidocker"; then
-    echo "UNEXPECTED: running in minidocker cgroup"
-else
-    echo "OK: not in minidocker cgroup"
-fi
-`)
+		"/bin/sleep", "10")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("minidocker run failed: %v\nOutput: %s", err, output)
 	}
 
-	if strings.Contains(string(output), "UNEXPECTED") {
-		t.Errorf("Container should not be in minidocker cgroup when no limits are set")
+	containerID := strings.TrimSpace(string(output))
+	t.Cleanup(func() { cleanupContainer(t, stateRoot, containerID) })
+
+	cgroupPath := filepath.Join("/sys/fs/cgroup/minidocker", containerID)
+	if _, err := os.Stat(cgroupPath); err == nil {
+		t.Fatalf("Cgroup directory should NOT exist when no limits are set: %s", cgroupPath)
 	}
 }
 
@@ -340,8 +443,10 @@ func TestInspectCgroupPath(t *testing.T) {
 	rootfs := prepareMinimalRootfs(t)
 	defer os.RemoveAll(rootfs)
 
+	stateRoot := t.TempDir()
+
 	// 运行后台容器
-	runCmd := exec.Command(minidockerBin, "run",
+	runCmd := exec.Command(minidockerBin, "--root", stateRoot, "run",
 		"-d",
 		"-m", "64m",
 		"--rootfs", rootfs,
@@ -354,12 +459,11 @@ func TestInspectCgroupPath(t *testing.T) {
 	containerID := strings.TrimSpace(string(output))
 	defer func() {
 		// 清理
-		exec.Command(minidockerBin, "kill", containerID).Run()
-		exec.Command(minidockerBin, "rm", containerID).Run()
+		cleanupContainer(t, stateRoot, containerID)
 	}()
 
 	// 检查 inspect 输出
-	inspectCmd := exec.Command(minidockerBin, "inspect", containerID)
+	inspectCmd := exec.Command(minidockerBin, "--root", stateRoot, "inspect", containerID)
 	inspectOutput, err := inspectCmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("minidocker inspect failed: %v\nOutput: %s", err, inspectOutput)
