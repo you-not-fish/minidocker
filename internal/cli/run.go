@@ -28,7 +28,13 @@ var (
 	interactive bool
 	rootfs      string // Phase 2 新增
 	detach      bool   // Phase 3 新增：后台运行
-	// name     string // Phase 11 实现：容器名称
+
+	// Phase 11 新增：容器配置
+	containerName string   // --name
+	hostname      string   // --hostname
+	envVars       []string // -e, --env
+	workDir       string   // -w, --workdir
+	user          string   // -u, --user
 
 	// Phase 6 新增：资源限制
 	memoryLimit string // -m, --memory，如 "512m", "1g"
@@ -79,6 +85,13 @@ var runCmd = &cobra.Command{
   - -v volume_name:/container/path     # Named volume
   - -v volume_name:/container/path:ro  # Named volume（只读）
 
+容器配置（Phase 11）：
+  - --name       容器名称，用于引用容器
+  - --hostname   容器主机名（默认: 容器 ID 前 12 位）
+  - -e, --env    设置环境变量（格式: KEY=VALUE）
+  - -w, --workdir 容器内工作目录
+  - -u, --user   运行用户（格式: user[:group] 或 uid[:gid]）
+
 示例:
   minidocker run alpine:latest /bin/sh
   minidocker run -it alpine /bin/sh
@@ -91,6 +104,11 @@ var runCmd = &cobra.Command{
   minidocker run -p 8080:80 alpine /bin/httpd
   minidocker run -v /host/data:/data alpine /bin/sh
   minidocker run -v myvolume:/data alpine /bin/sh
+  minidocker run --name my-container alpine /bin/sh
+  minidocker run --hostname myhost alpine /bin/sh
+  minidocker run -e FOO=bar -e BAZ=qux alpine /bin/sh
+  minidocker run -w /app alpine /bin/sh
+  minidocker run -u nobody alpine /bin/sh
   minidocker run --rootfs /tmp/rootfs /bin/sh`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: runContainer,
@@ -123,8 +141,12 @@ func init() {
 	// Phase 10 新增：卷挂载
 	runCmd.Flags().StringArrayVarP(&volumes, "volume", "v", nil, "绑定挂载或命名卷（格式: /host:/container[:ro] 或 name:/container[:ro]）")
 
-	// Phase 11 预留：容器名称（当前不实现）
-	// runCmd.Flags().StringVar(&name, "name", "", "容器名称")
+	// Phase 11 新增：容器配置
+	runCmd.Flags().StringVar(&containerName, "name", "", "容器名称")
+	runCmd.Flags().StringVar(&hostname, "hostname", "", "容器主机名（默认: 容器 ID 前 12 位）")
+	runCmd.Flags().StringArrayVarP(&envVars, "env", "e", nil, "设置环境变量（格式: KEY=VALUE）")
+	runCmd.Flags().StringVarP(&workDir, "workdir", "w", "", "容器内工作目录")
+	runCmd.Flags().StringVarP(&user, "user", "u", "", "运行用户（格式: user[:group] 或 uid[:gid]）")
 }
 
 func runContainer(cmd *cobra.Command, args []string) error {
@@ -190,6 +212,19 @@ func runContainer(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid volume configuration: %w", err)
 	}
 
+	// Phase 11: 解析容器配置
+	parsedEnvVars, err := parseEnvVars(envVars)
+	if err != nil {
+		return fmt.Errorf("invalid environment variable: %w", err)
+	}
+
+	// Phase 11: 验证容器名称
+	if containerName != "" {
+		if err := validateContainerName(containerName); err != nil {
+			return fmt.Errorf("invalid container name: %w", err)
+		}
+	}
+
 	// Phase 3: 初始化状态存储
 	store, err := state.NewStore(rootDir)
 	if err != nil {
@@ -207,11 +242,20 @@ func runContainer(cmd *cobra.Command, args []string) error {
 		NetworkConfig: networkConfig, // Phase 7 新增
 		Image:         imageRef,      // Phase 9 新增
 		Mounts:        mounts,        // Phase 10 新增
+		Name:          containerName, // Phase 11 新增
+		Env:           parsedEnvVars, // Phase 11 新增
+		WorkingDir:    workDir,       // Phase 11 新增
+		User:          user,          // Phase 11 新增
 	}
 
 	// 生成容器 ID（64位十六进制，前12位用作默认主机名）
 	config.ID = runtime.GenerateContainerID()
-	config.Hostname = config.ID[:12]
+	// Phase 11: 支持自定义主机名，默认使用容器 ID 前 12 位
+	if hostname != "" {
+		config.Hostname = hostname
+	} else {
+		config.Hostname = config.ID[:12]
+	}
 
 	// Phase 9: 如果指定了镜像，使用 snapshotter 准备 rootfs
 	if imageRef != "" {
@@ -612,4 +656,87 @@ func parseVolumeSpec(spec string) (volume.Mount, error) {
 	}
 
 	return mount, nil
+}
+
+// parseEnvVars 解析环境变量参数
+// 支持格式:
+//   - KEY=VALUE: 设置环境变量
+//   - KEY: 从宿主环境继承变量值
+func parseEnvVars(envs []string) ([]string, error) {
+	var result []string
+
+	for _, env := range envs {
+		// 检查是否包含 = 号
+		if idx := strings.Index(env, "="); idx != -1 {
+			// KEY=VALUE 格式
+			key := env[:idx]
+			if key == "" {
+				return nil, fmt.Errorf("empty variable name in %q", env)
+			}
+			// 验证变量名合法性
+			if !isValidEnvName(key) {
+				return nil, fmt.Errorf("invalid variable name %q", key)
+			}
+			result = append(result, env)
+		} else {
+			// KEY 格式：从宿主环境继承
+			if !isValidEnvName(env) {
+				return nil, fmt.Errorf("invalid variable name %q", env)
+			}
+			if value, ok := os.LookupEnv(env); ok {
+				result = append(result, env+"="+value)
+			}
+			// 如果宿主环境没有该变量，静默忽略（对齐 Docker 行为）
+		}
+	}
+
+	return result, nil
+}
+
+// isValidEnvName 检查环境变量名是否合法
+// 规则：以字母或下划线开头，后续可以是字母、数字或下划线
+func isValidEnvName(name string) bool {
+	if len(name) == 0 {
+		return false
+	}
+	for i, r := range name {
+		if i == 0 {
+			if !(r >= 'A' && r <= 'Z') && !(r >= 'a' && r <= 'z') && r != '_' {
+				return false
+			}
+		} else {
+			if !(r >= 'A' && r <= 'Z') && !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') && r != '_' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// validateContainerName 验证容器名称
+// 规则：以字母或数字开头，后续可以是字母、数字、下划线、点或连字符
+func validateContainerName(name string) error {
+	if len(name) == 0 {
+		return fmt.Errorf("name cannot be empty")
+	}
+	if len(name) > 128 {
+		return fmt.Errorf("name too long (max 128 characters)")
+	}
+
+	for i, r := range name {
+		if i == 0 {
+			// 首字符必须是字母或数字
+			if !(r >= 'A' && r <= 'Z') && !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') {
+				return fmt.Errorf("name must start with alphanumeric character")
+			}
+		} else {
+			// 后续字符可以是字母、数字、下划线、点或连字符
+			if !(r >= 'A' && r <= 'Z') && !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') &&
+				r != '_' && r != '.' && r != '-' {
+				return fmt.Errorf("name can only contain alphanumeric characters, underscores, dots, and hyphens")
+			}
+		}
+	}
+
+	return nil
 }

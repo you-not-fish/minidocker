@@ -16,6 +16,13 @@ var (
 	interactive bool
 	rootfs      string
 	detach      bool
+
+	// Phase 11 新增
+	containerName string
+	hostname      string
+	envVars       []string
+	workDir       string
+	user          string
 )
 
 var runCmd = &cobra.Command{
@@ -33,4 +40,11 @@ func init() {
 	runCmd.Flags().BoolVarP(&interactive, "interactive", "i", false, "保持 STDIN 打开")
 	runCmd.Flags().StringVar(&rootfs, "rootfs", "", "容器根文件系统路径")
 	runCmd.Flags().BoolVarP(&detach, "detach", "d", false, "后台运行容器")
+
+	// Phase 11 新增
+	runCmd.Flags().StringVar(&containerName, "name", "", "容器名称")
+	runCmd.Flags().StringVar(&hostname, "hostname", "", "容器主机名")
+	runCmd.Flags().StringArrayVarP(&envVars, "env", "e", nil, "设置环境变量")
+	runCmd.Flags().StringVarP(&workDir, "workdir", "w", "", "容器内工作目录")
+	runCmd.Flags().StringVarP(&user, "user", "u", "", "运行用户")
 }

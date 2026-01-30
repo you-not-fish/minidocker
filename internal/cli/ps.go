@@ -51,6 +51,7 @@ func init() {
 // PsEntry 表示 ps 命令的单行输出
 type PsEntry struct {
 	ID       string    `json:"Id"`
+	Names    string    `json:"Names,omitempty"` // Phase 11: 容器名称
 	Status   string    `json:"Status"`
 	Created  time.Time `json:"Created"`
 	Command  string    `json:"Command"`
@@ -80,8 +81,11 @@ func listContainers(cmd *cobra.Command, args []string) error {
 		}
 
 		command := strings.Join(config.GetCommand(), " ")
+		// Phase 11: 获取容器名称
+		containerName := store.NameStore.GetName(s.ID)
 		entry := PsEntry{
 			ID:       s.ID,
+			Names:    containerName,
 			Status:   string(s.Status),
 			Created:  s.CreatedAt,
 			Command:  command,
@@ -131,12 +135,19 @@ func outputTable(entries []PsEntry) error {
 
 	// 使用 tabwriter 格式化表格输出
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-	fmt.Fprintln(w, "CONTAINER ID\tSTATUS\tCREATED\tCOMMAND")
+	// Phase 11: 添加 NAMES 列
+	fmt.Fprintln(w, "CONTAINER ID\tNAMES\tSTATUS\tCREATED\tCOMMAND")
 
 	for _, entry := range entries {
 		id := entry.ID
 		if !psNoTrunc {
 			id = shortID(id)
+		}
+
+		// Phase 11: 显示容器名称
+		names := entry.Names
+		if names == "" {
+			names = "-"
 		}
 
 		command := entry.Command
@@ -146,7 +157,7 @@ func outputTable(entries []PsEntry) error {
 
 		created := formatCreatedTime(entry.Created)
 
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", id, entry.Status, created, command)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", id, names, entry.Status, created, command)
 	}
 
 	return w.Flush()

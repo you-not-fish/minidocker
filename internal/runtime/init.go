@@ -4,12 +4,14 @@
 package runtime
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -76,13 +78,17 @@ func getConfig() (*ContainerConfig, error) {
 	}
 
 	config := &ContainerConfig{
-		ID:       cfg.ID,
-		Command:  cfg.Command,
-		Args:     cfg.Args,
-		Hostname: cfg.Hostname,
-		TTY:      cfg.TTY,
-		Rootfs:   cfg.Rootfs,
-		Detached: cfg.Detached,
+		ID:         cfg.ID,
+		Command:    cfg.Command,
+		Args:       cfg.Args,
+		Hostname:   cfg.Hostname,
+		TTY:        cfg.TTY,
+		Rootfs:     cfg.Rootfs,
+		Detached:   cfg.Detached,
+		Name:       cfg.Name,       // Phase 11
+		Env:        cfg.Env,        // Phase 11
+		WorkingDir: cfg.WorkingDir, // Phase 11
+		User:       cfg.User,       // Phase 11
 	}
 
 	// Phase 10: 加载挂载配置
@@ -155,19 +161,228 @@ func runUserCommand(config *ContainerConfig) int {
 		return 1
 	}
 
+	// Phase 11: 切换用户（必须在 exec 前完成）
+	if config.User != "" {
+		if err := switchUser(config.User, config.Rootfs); err != nil {
+			fmt.Fprintf(os.Stderr, "init: switch user: %v\n", err)
+			return 1
+		}
+	}
+
+	// Phase 11: 切换工作目录
+	if config.WorkingDir != "" {
+		if err := os.Chdir(config.WorkingDir); err != nil {
+			fmt.Fprintf(os.Stderr, "init: chdir to %s: %v\n", config.WorkingDir, err)
+			return 1
+		}
+	}
+
 	// 创建命令
 	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	// 设置环境（对于第11阶段，我们将在此添加自定义环境变量）
-	// 清除 MINIDOCKER_* 环境变量，以防泄露到容器中
-	cmd.Env = envutil.FilterMinidockerEnv(os.Environ())
+	// Phase 11: 设置环境变量
+	// 1. 从基础环境开始（过滤掉 MINIDOCKER_* 变量）
+	// 2. 合并用户指定的环境变量（覆盖同名变量）
+	baseEnv := envutil.FilterMinidockerEnv(os.Environ())
+	cmd.Env = mergeEnvVars(baseEnv, config.Env)
 
 	// 设置信号处理（并在其中启动用户命令）
 	// PID 1 必须能转发信号并回收僵尸进程
 	return handleSignalsAndWait(cmd)
+}
+
+// switchUser 切换运行用户
+// 支持格式:
+//   - user: 用户名或 UID
+//   - user:group: 用户名/UID 和 组名/GID
+//
+// 注意: 必须在 exec 前调用，因为 setuid/setgid 只影响当前进程
+//
+// 安全关键：调用顺序必须是 setgroups → setgid → setuid
+// 原因：一旦 setuid 降权后，进程可能失去修改 groups/gid 的权限
+func switchUser(userSpec, rootfs string) error {
+	uid, gid, err := parseUserSpec(userSpec, rootfs)
+	if err != nil {
+		return err
+	}
+
+	// 1. 首先设置 supplementary groups（必须在 setuid 之前）
+	// 使用只包含目标 GID 的列表，清空其他 supplementary groups
+	// 安全关键：如果失败必须中止，否则可能保留原 supplementary groups（如 root 组）
+	if err := syscall.Setgroups([]int{gid}); err != nil {
+		return fmt.Errorf("setgroups([%d]): %w", gid, err)
+	}
+
+	// 2. 设置 GID（必须在 setuid 之前）
+	if err := syscall.Setgid(gid); err != nil {
+		return fmt.Errorf("setgid(%d): %w", gid, err)
+	}
+
+	// 3. 最后设置 UID（降权操作，之后无法再修改 groups/gid）
+	if err := syscall.Setuid(uid); err != nil {
+		return fmt.Errorf("setuid(%d): %w", uid, err)
+	}
+
+	return nil
+}
+
+// parseUserSpec 解析用户规格
+// 支持格式:
+//   - "1000" -> uid=1000, gid=1000
+//   - "1000:1000" -> uid=1000, gid=1000
+//   - "nobody" -> 从 /etc/passwd 解析
+//   - "nobody:nogroup" -> 从 /etc/passwd 和 /etc/group 解析
+func parseUserSpec(spec, rootfs string) (uid, gid int, err error) {
+	parts := strings.SplitN(spec, ":", 2)
+	userPart := parts[0]
+	groupPart := ""
+	if len(parts) > 1 {
+		groupPart = parts[1]
+	}
+
+	// 解析用户
+	uid, gid, err = lookupUser(userPart, rootfs)
+	if err != nil {
+		return 0, 0, fmt.Errorf("lookup user %q: %w", userPart, err)
+	}
+
+	// 如果指定了组，覆盖 gid
+	if groupPart != "" {
+		gid, err = lookupGroup(groupPart, rootfs)
+		if err != nil {
+			return 0, 0, fmt.Errorf("lookup group %q: %w", groupPart, err)
+		}
+	}
+
+	return uid, gid, nil
+}
+
+// lookupUser 查找用户 UID 和 GID
+// 如果是数字，直接解析；否则从 /etc/passwd 查找
+func lookupUser(name, rootfs string) (uid, gid int, err error) {
+	// 尝试解析为数字
+	if id, err := parseID(name); err == nil {
+		return id, id, nil // 默认 gid = uid
+	}
+
+	// 从 /etc/passwd 查找
+	passwdPath := "/etc/passwd"
+	if rootfs != "" {
+		// 在 pivot_root 之前，需要使用 rootfs 路径
+		// 但在 pivot_root 之后，直接使用 /etc/passwd
+	}
+
+	file, err := os.Open(passwdPath)
+	if err != nil {
+		return 0, 0, fmt.Errorf("open %s: %w", passwdPath, err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Split(line, ":")
+		if len(fields) < 4 {
+			continue
+		}
+		if fields[0] == name {
+			uid, err := parseID(fields[2])
+			if err != nil {
+				return 0, 0, fmt.Errorf("parse uid %q: %w", fields[2], err)
+			}
+			gid, err := parseID(fields[3])
+			if err != nil {
+				return 0, 0, fmt.Errorf("parse gid %q: %w", fields[3], err)
+			}
+			return uid, gid, nil
+		}
+	}
+
+	return 0, 0, fmt.Errorf("user %q not found in %s", name, passwdPath)
+}
+
+// lookupGroup 查找组 GID
+// 如果是数字，直接解析；否则从 /etc/group 查找
+func lookupGroup(name, rootfs string) (gid int, err error) {
+	// 尝试解析为数字
+	if id, err := parseID(name); err == nil {
+		return id, nil
+	}
+
+	// 从 /etc/group 查找
+	groupPath := "/etc/group"
+
+	file, err := os.Open(groupPath)
+	if err != nil {
+		return 0, fmt.Errorf("open %s: %w", groupPath, err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Split(line, ":")
+		if len(fields) < 3 {
+			continue
+		}
+		if fields[0] == name {
+			gid, err := parseID(fields[2])
+			if err != nil {
+				return 0, fmt.Errorf("parse gid %q: %w", fields[2], err)
+			}
+			return gid, nil
+		}
+	}
+
+	return 0, fmt.Errorf("group %q not found in %s", name, groupPath)
+}
+
+// parseID 解析数字 ID
+func parseID(s string) (int, error) {
+	id, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, err
+	}
+	if id < 0 {
+		return 0, fmt.Errorf("id must be non-negative")
+	}
+	return id, nil
+}
+
+// mergeEnvVars 合并环境变量，后者覆盖前者
+func mergeEnvVars(base, override []string) []string {
+	envMap := make(map[string]string)
+
+	// 解析基础环境
+	for _, env := range base {
+		if idx := strings.Index(env, "="); idx != -1 {
+			envMap[env[:idx]] = env[idx+1:]
+		}
+	}
+
+	// 覆盖/添加用户指定的环境变量
+	for _, env := range override {
+		if idx := strings.Index(env, "="); idx != -1 {
+			envMap[env[:idx]] = env[idx+1:]
+		}
+	}
+
+	// 转换回切片
+	result := make([]string, 0, len(envMap))
+	for k, v := range envMap {
+		result = append(result, k+"="+v)
+	}
+
+	return result
 }
 
 // handleSignalsAndWait 负责：

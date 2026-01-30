@@ -20,7 +20,8 @@ const RootDirEnvVar = "MINIDOCKER_ROOT"
 
 // Store 管理容器状态目录
 type Store struct {
-	RootDir string
+	RootDir   string
+	NameStore *NameStore
 }
 
 // NewStore 创建状态存储。
@@ -41,7 +42,10 @@ func NewStore(rootDir string) (*Store, error) {
 		return nil, fmt.Errorf("create containers directory: %w", err)
 	}
 
-	return &Store{RootDir: rootDir}, nil
+	return &Store{
+		RootDir:   rootDir,
+		NameStore: NewNameStore(rootDir),
+	}, nil
 }
 
 // ContainerDir 返回容器目录路径
@@ -59,8 +63,19 @@ func (s *Store) Create(config *ContainerConfig) (*ContainerState, error) {
 		return nil, fmt.Errorf("container %s already exists", config.ID)
 	}
 
+	// Phase 11: 如果指定了名称，先检查并注册名称
+	if config.Name != "" {
+		if err := s.NameStore.Register(config.Name, config.ID); err != nil {
+			return nil, err
+		}
+	}
+
 	// 创建目录结构
 	if err := os.MkdirAll(containerDir, 0755); err != nil {
+		// 如果创建目录失败，需要回滚名称注册
+		if config.Name != "" {
+			_ = s.NameStore.Unregister(config.Name)
+		}
 		return nil, fmt.Errorf("create container directory: %w", err)
 	}
 
@@ -68,12 +83,18 @@ func (s *Store) Create(config *ContainerConfig) (*ContainerState, error) {
 	logDir := filepath.Join(containerDir, "logs")
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		os.RemoveAll(containerDir)
+		if config.Name != "" {
+			_ = s.NameStore.Unregister(config.Name)
+		}
 		return nil, fmt.Errorf("create logs directory: %w", err)
 	}
 
 	// 保存 config.json
 	if err := config.Save(containerDir); err != nil {
 		os.RemoveAll(containerDir)
+		if config.Name != "" {
+			_ = s.NameStore.Unregister(config.Name)
+		}
 		return nil, fmt.Errorf("save config: %w", err)
 	}
 
@@ -81,6 +102,9 @@ func (s *Store) Create(config *ContainerConfig) (*ContainerState, error) {
 	state := NewState(config.ID, containerDir)
 	if err := state.Save(); err != nil {
 		os.RemoveAll(containerDir)
+		if config.Name != "" {
+			_ = s.NameStore.Unregister(config.Name)
+		}
 		return nil, fmt.Errorf("save state: %w", err)
 	}
 
@@ -165,6 +189,9 @@ func (s *Store) Delete(containerID string) error {
 		return fmt.Errorf("container %s is running, stop it first or use force", idutil.ShortID(containerID))
 	}
 
+	// Phase 11: 清理名称映射
+	_ = s.NameStore.UnregisterByID(containerID)
+
 	// 删除目录
 	if err := os.RemoveAll(containerDir); err != nil {
 		return fmt.Errorf("remove container directory: %w", err)
@@ -180,21 +207,26 @@ func (s *Store) Exists(containerID string) bool {
 	return err == nil
 }
 
-// LookupID 将短 ID 解析为完整 ID。
-// 要求至少 3 个字符。
+// LookupID 将短 ID、完整 ID 或名称解析为完整 ID。
+// 对于 ID，要求至少 3 个字符。
 // 如果有多个匹配，返回错误。
-func (s *Store) LookupID(idOrPrefix string) (string, error) {
+func (s *Store) LookupID(idOrNameOrPrefix string) (string, error) {
+	// Phase 11: 首先尝试通过名称查找
+	if containerID, err := s.NameStore.Lookup(idOrNameOrPrefix); err == nil && containerID != "" {
+		return containerID, nil
+	}
+
 	// 短 ID 至少需要 3 个字符
-	if err := idutil.ValidatePrefix(idOrPrefix); err != nil {
+	if err := idutil.ValidatePrefix(idOrNameOrPrefix); err != nil {
 		return "", err
 	}
 
 	// 如果是完整 ID（64 字符），直接返回
-	if idutil.IsFullID(idOrPrefix) {
-		if s.Exists(idOrPrefix) {
-			return idOrPrefix, nil
+	if idutil.IsFullID(idOrNameOrPrefix) {
+		if s.Exists(idOrNameOrPrefix) {
+			return idOrNameOrPrefix, nil
 		}
-		return "", fmt.Errorf("container not found: %s", idOrPrefix)
+		return "", fmt.Errorf("container not found: %s", idOrNameOrPrefix)
 	}
 
 	// 搜索匹配的容器
@@ -202,7 +234,7 @@ func (s *Store) LookupID(idOrPrefix string) (string, error) {
 	entries, err := os.ReadDir(containersDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", fmt.Errorf("container not found: %s", idOrPrefix)
+			return "", fmt.Errorf("container not found: %s", idOrNameOrPrefix)
 		}
 		return "", fmt.Errorf("read containers directory: %w", err)
 	}
@@ -213,18 +245,18 @@ func (s *Store) LookupID(idOrPrefix string) (string, error) {
 			continue
 		}
 		name := entry.Name()
-		if strings.HasPrefix(name, idOrPrefix) {
+		if strings.HasPrefix(name, idOrNameOrPrefix) {
 			matches = append(matches, name)
 		}
 	}
 
 	switch len(matches) {
 	case 0:
-		return "", fmt.Errorf("container not found: %s", idOrPrefix)
+		return "", fmt.Errorf("container not found: %s", idOrNameOrPrefix)
 	case 1:
 		return matches[0], nil
 	default:
-		return "", fmt.Errorf("multiple containers match prefix %s: %v", idOrPrefix, matches[:min(3, len(matches))])
+		return "", fmt.Errorf("multiple containers match prefix %s: %v", idOrNameOrPrefix, matches[:min(3, len(matches))])
 	}
 }
 
@@ -237,6 +269,9 @@ func (s *Store) ForceDelete(containerID string) error {
 	if _, err := os.Stat(containerDir); os.IsNotExist(err) {
 		return nil // 幂等：已删除
 	}
+
+	// Phase 11: 清理名称映射
+	_ = s.NameStore.UnregisterByID(containerID)
 
 	// 直接删除
 	if err := os.RemoveAll(containerDir); err != nil {

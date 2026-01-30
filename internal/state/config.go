@@ -66,20 +66,18 @@ type ContainerConfig struct {
 	// 与 Rootfs 互斥：有 Image 时使用 snapshotter 准备 rootfs
 	Image string `json:"image,omitempty"`
 
-	// --- Phase 11 预留字段（当前不实现）---
+	// --- Phase 11: 容器配置 ---
 	// Name 容器名称
-	// 在 Phase 11 实现完整的名称到 ID 的映射功能
-	// Name string `json:"name,omitempty"`
+	Name string `json:"name,omitempty"`
 
-	// --- Phase 11 预留字段 ---
 	// Env 环境变量
-	// Env []string `json:"env,omitempty"`
+	Env []string `json:"env,omitempty"`
 
 	// WorkingDir 工作目录
-	// WorkingDir string `json:"workingDir,omitempty"`
+	WorkingDir string `json:"workingDir,omitempty"`
 
 	// User 运行用户
-	// User string `json:"user,omitempty"`
+	User string `json:"user,omitempty"`
 
 	// --- Phase 10: 卷挂载 ---
 	// Mounts 保存挂载点配置（bind mounts 和 named volumes）

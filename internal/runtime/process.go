@@ -90,14 +90,18 @@ func Run(config *ContainerConfig, opts *RunOptions) (int, error) {
 
 	// 1. 创建状态目录和初始状态
 	stateConfig := &state.ContainerConfig{
-		ID:       config.ID,
-		Command:  config.Command,
-		Args:     config.Args,
-		Hostname: config.Hostname,
-		Rootfs:   config.Rootfs,
-		TTY:      config.TTY,
-		Detached: config.Detached,
-		Image:    config.Image, // Phase 9
+		ID:         config.ID,
+		Command:    config.Command,
+		Args:       config.Args,
+		Hostname:   config.Hostname,
+		Rootfs:     config.Rootfs,
+		TTY:        config.TTY,
+		Detached:   config.Detached,
+		Image:      config.Image,      // Phase 9
+		Name:       config.Name,       // Phase 11
+		Env:        config.Env,        // Phase 11
+		WorkingDir: config.WorkingDir, // Phase 11
+		User:       config.User,       // Phase 11
 	}
 
 	// Phase 6: 添加 cgroup 配置到状态

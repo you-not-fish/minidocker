@@ -16,7 +16,8 @@ const (
 
 // Store 是状态存储的 stub
 type Store struct {
-	RootDir string
+	RootDir   string
+	NameStore *NameStore
 }
 
 // ContainerState 是容器状态的 stub

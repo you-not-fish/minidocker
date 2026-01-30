@@ -45,10 +45,9 @@ type ContainerConfig struct {
 	// User 指定在容器内运行的用户（第11阶段：--user）
 	User string
 
-	// --- Phase 11 预留字段（当前不实现） ---
+	// --- Phase 11: 容器名称 ---
 	// Name 是容器名称，用于替代 ID 进行引用
-	// 在 Phase 11 实现完整的名称到 ID 映射功能
-	// Name string
+	Name string
 
 	// --- Phase 6: cgroup 资源限制 ---
 	// CgroupConfig 保存容器的资源限制配置（内存、CPU、进程数）
