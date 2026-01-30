@@ -17,6 +17,7 @@ import (
 	"minidocker/internal/network"
 	"minidocker/internal/snapshot"
 	"minidocker/internal/state"
+	"minidocker/internal/volume"
 	"minidocker/pkg/envutil"
 
 	"golang.org/x/sys/unix"
@@ -60,6 +61,11 @@ func (l *logFiles) Close() {
 // - 在启动进程后配置网络（需要 PID 来移动 veth）
 // - 容器退出后清理网络资源
 //
+// Phase 10 更新：
+// - 集成卷挂载配置（bind mounts 和 named volumes）
+// - 在启动进程前解析 named volumes（自动创建不存在的卷）
+// - 卷挂载在 init 进程中执行（pivot_root 之后）
+//
 // 注意：这个函数不应该调用 os.Exit。
 // 退出码应由 CLI（或后续阶段的 daemon/manager）统一处理。
 func Run(config *ContainerConfig, opts *RunOptions) (int, error) {
@@ -72,6 +78,14 @@ func Run(config *ContainerConfig, opts *RunOptions) (int, error) {
 	// Still, we record the deterministic mount path for observability.
 	if config.Image != "" && config.Rootfs == "" {
 		config.Rootfs = filepath.Join(opts.StateStore.RootDir, snapshot.DefaultSnapshotsDir, "containers", config.ID, "rootfs")
+	}
+
+	// Phase 10: 解析 named volumes（前台模式在此处，后台模式由 shim 负责）
+	// 注意：bind mounts 不需要解析，直接使用源路径
+	if len(config.Mounts) > 0 && !config.Detached {
+		if err := prepareMounts(config.Mounts, opts.StateStore.RootDir); err != nil {
+			return -1, fmt.Errorf("prepare mounts: %w", err)
+		}
 	}
 
 	// 1. 创建状态目录和初始状态
@@ -107,6 +121,20 @@ func Run(config *ContainerConfig, opts *RunOptions) (int, error) {
 					ContainerPort: pm.ContainerPort,
 					Protocol:      pm.Protocol,
 				}
+			}
+		}
+	}
+
+	// Phase 10: 添加卷挂载配置到状态
+	if len(config.Mounts) > 0 {
+		stateConfig.Mounts = make([]state.MountConfig, len(config.Mounts))
+		for i, m := range config.Mounts {
+			stateConfig.Mounts[i] = state.MountConfig{
+				Type:       string(m.Type),
+				Source:     m.Source,
+				Target:     m.Target,
+				ReadOnly:   m.ReadOnly,
+				VolumePath: m.VolumePath,
 			}
 		}
 	}
@@ -508,5 +536,53 @@ func setMountPropagation() error {
 	if err := unix.Mount("", "/", "", unix.MS_PRIVATE|unix.MS_REC, ""); err != nil {
 		return fmt.Errorf("failed to set mount propagation to private: %w", err)
 	}
+	return nil
+}
+
+// prepareMounts 解析 named volumes 并填充 VolumePath
+// 对于 bind mounts，不需要解析，直接使用 Source
+// 对于 named volumes，自动创建不存在的卷（Docker 行为）
+func prepareMounts(mounts []volume.Mount, rootDir string) error {
+	// 检查是否有 named volumes 需要解析
+	hasVolumes := false
+	for _, m := range mounts {
+		if m.Type == volume.MountTypeVolume {
+			hasVolumes = true
+			break
+		}
+	}
+
+	if !hasVolumes {
+		return nil
+	}
+
+	// 初始化卷存储
+	volumeStore, err := volume.NewVolumeStore(rootDir)
+	if err != nil {
+		return fmt.Errorf("initialize volume store: %w", err)
+	}
+
+	// 解析每个 named volume
+	for i, m := range mounts {
+		if m.Type != volume.MountTypeVolume {
+			continue
+		}
+
+		// 自动创建不存在的卷（Docker 行为）
+		if !volumeStore.Exists(m.Source) {
+			if _, err := volumeStore.Create(m.Source); err != nil {
+				return fmt.Errorf("create volume %s: %w", m.Source, err)
+			}
+		}
+
+		// 获取卷信息并填充 VolumePath
+		vol, err := volumeStore.Get(m.Source)
+		if err != nil {
+			return fmt.Errorf("get volume %s: %w", m.Source, err)
+		}
+
+		mounts[i].VolumePath = vol.Path
+	}
+
 	return nil
 }

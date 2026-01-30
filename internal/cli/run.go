@@ -17,6 +17,7 @@ import (
 	"minidocker/internal/runtime"
 	"minidocker/internal/snapshot"
 	"minidocker/internal/state"
+	"minidocker/internal/volume"
 
 	"github.com/spf13/cobra"
 )
@@ -40,6 +41,9 @@ var (
 	// Phase 7 新增：网络配置
 	networkMode  string   // --network，如 "bridge", "host", "none"
 	publishPorts []string // -p, --publish，如 "8080:80", "8080:80/tcp"
+
+	// Phase 10 新增：卷挂载
+	volumes []string // -v, --volume，如 "/host:/container", "volume:/container:ro"
 )
 
 var runCmd = &cobra.Command{
@@ -69,6 +73,12 @@ var runCmd = &cobra.Command{
   - host: 共享宿主机网络
   - none: 只有 loopback 的独立网络命名空间
 
+卷挂载（Phase 10）：
+  - -v /host/path:/container/path      # Bind mount
+  - -v /host/path:/container/path:ro   # Bind mount（只读）
+  - -v volume_name:/container/path     # Named volume
+  - -v volume_name:/container/path:ro  # Named volume（只读）
+
 示例:
   minidocker run alpine:latest /bin/sh
   minidocker run -it alpine /bin/sh
@@ -79,6 +89,8 @@ var runCmd = &cobra.Command{
   minidocker run --network bridge alpine /bin/sh
   minidocker run --network host alpine /bin/sh
   minidocker run -p 8080:80 alpine /bin/httpd
+  minidocker run -v /host/data:/data alpine /bin/sh
+  minidocker run -v myvolume:/data alpine /bin/sh
   minidocker run --rootfs /tmp/rootfs /bin/sh`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: runContainer,
@@ -107,6 +119,9 @@ func init() {
 	// Phase 7 新增：网络配置
 	runCmd.Flags().StringVar(&networkMode, "network", "bridge", "网络模式（bridge/host/none）")
 	runCmd.Flags().StringArrayVarP(&publishPorts, "publish", "p", nil, "发布端口（格式: [hostIP:]hostPort:containerPort[/protocol]）")
+
+	// Phase 10 新增：卷挂载
+	runCmd.Flags().StringArrayVarP(&volumes, "volume", "v", nil, "绑定挂载或命名卷（格式: /host:/container[:ro] 或 name:/container[:ro]）")
 
 	// Phase 11 预留：容器名称（当前不实现）
 	// runCmd.Flags().StringVar(&name, "name", "", "容器名称")
@@ -169,6 +184,12 @@ func runContainer(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid network configuration: %w", err)
 	}
 
+	// Phase 10: 解析卷挂载配置
+	mounts, err := parseVolumeFlags()
+	if err != nil {
+		return fmt.Errorf("invalid volume configuration: %w", err)
+	}
+
 	// Phase 3: 初始化状态存储
 	store, err := state.NewStore(rootDir)
 	if err != nil {
@@ -185,6 +206,7 @@ func runContainer(cmd *cobra.Command, args []string) error {
 		CgroupConfig:  cgroupConfig,  // Phase 6 新增
 		NetworkConfig: networkConfig, // Phase 7 新增
 		Image:         imageRef,      // Phase 9 新增
+		Mounts:        mounts,        // Phase 10 新增
 	}
 
 	// 生成容器 ID（64位十六进制，前12位用作默认主机名）
@@ -502,4 +524,92 @@ func parsePort(s string) (uint16, error) {
 		return 0, fmt.Errorf("port must be between 1 and 65535")
 	}
 	return uint16(port), nil
+}
+
+// parseVolumeFlags 解析 -v 参数并返回 Mount 配置列表
+func parseVolumeFlags() ([]volume.Mount, error) {
+	var mounts []volume.Mount
+
+	for _, spec := range volumes {
+		mount, err := parseVolumeSpec(spec)
+		if err != nil {
+			return nil, fmt.Errorf("invalid volume spec %q: %w", spec, err)
+		}
+		mounts = append(mounts, mount)
+	}
+
+	return mounts, nil
+}
+
+// parseVolumeSpec 解析单个卷挂载规格
+// 支持格式:
+//   - /host/path:/container/path[:options]  -> bind mount
+//   - volume_name:/container/path[:options] -> named volume
+//
+// options: ro,rw (逗号分隔)
+func parseVolumeSpec(spec string) (volume.Mount, error) {
+	var mount volume.Mount
+
+	// 分割规格字符串
+	parts := strings.Split(spec, ":")
+
+	var source, target string
+	var optionsStr string
+
+	switch len(parts) {
+	case 2:
+		source, target = parts[0], parts[1]
+	case 3:
+		source, target, optionsStr = parts[0], parts[1], parts[2]
+	default:
+		return mount, fmt.Errorf("invalid format, expected source:target[:options]")
+	}
+
+	// 验证 source 不为空
+	if source == "" {
+		return mount, fmt.Errorf("source cannot be empty")
+	}
+
+	// 验证 target 是绝对路径
+	if !filepath.IsAbs(target) {
+		return mount, fmt.Errorf("container path must be absolute: %s", target)
+	}
+
+	// 判断挂载类型：绝对路径 = bind mount，否则 = named volume
+	if filepath.IsAbs(source) {
+		mount.Type = volume.MountTypeBind
+		// 验证 source 路径存在（bind mount 要求源路径存在）
+		if _, err := os.Stat(source); err != nil {
+			if os.IsNotExist(err) {
+				return mount, fmt.Errorf("source path does not exist: %s", source)
+			}
+			return mount, fmt.Errorf("cannot access source path: %w", err)
+		}
+	} else {
+		mount.Type = volume.MountTypeVolume
+		// 验证卷名有效性
+		if !volume.IsValidVolumeName(source) {
+			return mount, fmt.Errorf("invalid volume name: %s (must be alphanumeric, can contain hyphen and underscore)", source)
+		}
+	}
+
+	mount.Source = source
+	mount.Target = target
+
+	// 解析选项
+	if optionsStr != "" {
+		options := strings.Split(optionsStr, ",")
+		for _, opt := range options {
+			switch strings.ToLower(strings.TrimSpace(opt)) {
+			case "ro", "readonly":
+				mount.ReadOnly = true
+			case "rw":
+				mount.ReadOnly = false
+			default:
+				return mount, fmt.Errorf("unknown option: %s (supported: ro, rw)", opt)
+			}
+		}
+	}
+
+	return mount, nil
 }

@@ -15,6 +15,7 @@ import (
 	"minidocker/internal/network"
 	"minidocker/internal/snapshot"
 	"minidocker/internal/state"
+	"minidocker/internal/volume"
 	"minidocker/pkg/envutil"
 )
 
@@ -36,6 +37,10 @@ import (
 // Phase 9 更新：
 // - 使用 snapshotter 准备镜像 rootfs
 // - 容器退出后清理快照（unmount overlay + 删除 upper/work）
+//
+// Phase 10 更新：
+// - 解析 named volumes（自动创建不存在的卷）
+// - 卷挂载在 init 进程中执行
 //
 // This aligns with the industry "per-container shim" model (e.g. containerd-shim).
 func RunContainerShim() {
@@ -208,6 +213,34 @@ func RunContainerShim() {
 					fail("ensure bridge: %v", err)
 				}
 			}
+		}
+	}
+
+	// Phase 10: 从配置中恢复挂载配置并解析 named volumes
+	if len(cfg.Mounts) > 0 {
+		// 获取 rootDir（从 containerDir 向上两级）
+		rootDir := filepath.Dir(filepath.Dir(containerDir))
+
+		// 恢复挂载配置
+		rCfg.Mounts = make([]volume.Mount, len(cfg.Mounts))
+		for i, m := range cfg.Mounts {
+			rCfg.Mounts[i] = volume.Mount{
+				Type:       volume.MountType(m.Type),
+				Source:     m.Source,
+				Target:     m.Target,
+				ReadOnly:   m.ReadOnly,
+				VolumePath: m.VolumePath,
+			}
+		}
+
+		// 解析 named volumes（自动创建不存在的卷）
+		if err := prepareMounts(rCfg.Mounts, rootDir); err != nil {
+			fail("prepare mounts: %v", err)
+		}
+
+		// 更新状态配置中的 VolumePath（用于持久化）
+		for i := range cfg.Mounts {
+			cfg.Mounts[i].VolumePath = rCfg.Mounts[i].VolumePath
 		}
 	}
 

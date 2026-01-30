@@ -81,9 +81,30 @@ type ContainerConfig struct {
 	// User 运行用户
 	// User string `json:"user,omitempty"`
 
-	// --- Phase 10 预留字段 ---
-	// Mounts 挂载点
-	// Mounts []Mount `json:"mounts,omitempty"`
+	// --- Phase 10: 卷挂载 ---
+	// Mounts 保存挂载点配置（bind mounts 和 named volumes）
+	Mounts []MountConfig `json:"mounts,omitempty"`
+}
+
+// MountConfig 表示持久化的挂载配置
+type MountConfig struct {
+	// Type 是挂载类型（bind 或 volume）
+	Type string `json:"type"`
+
+	// Source 是来源路径或卷名
+	// - 对于 bind mount：主机上的绝对路径
+	// - 对于 named volume：卷名称
+	Source string `json:"source"`
+
+	// Target 是容器内的目标路径（绝对路径）
+	Target string `json:"target"`
+
+	// ReadOnly 表示是否只读挂载
+	ReadOnly bool `json:"readOnly,omitempty"`
+
+	// VolumePath 是 named volume 的实际数据路径（内部使用）
+	// 在卷解析后填充
+	VolumePath string `json:"volumePath,omitempty"`
 }
 
 // Save 保存配置到 config.json

@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"minidocker/internal/state"
+	"minidocker/internal/volume"
 	"minidocker/pkg/envutil"
 
 	"golang.org/x/sys/unix"
@@ -73,7 +74,7 @@ func getConfig() (*ContainerConfig, error) {
 		return nil, fmt.Errorf("load config from %s: %w", containerDir, err)
 	}
 
-	return &ContainerConfig{
+	config := &ContainerConfig{
 		ID:       cfg.ID,
 		Command:  cfg.Command,
 		Args:     cfg.Args,
@@ -81,7 +82,23 @@ func getConfig() (*ContainerConfig, error) {
 		TTY:      cfg.TTY,
 		Rootfs:   cfg.Rootfs,
 		Detached: cfg.Detached,
-	}, nil
+	}
+
+	// Phase 10: 加载挂载配置
+	if len(cfg.Mounts) > 0 {
+		config.Mounts = make([]volume.Mount, len(cfg.Mounts))
+		for i, m := range cfg.Mounts {
+			config.Mounts[i] = volume.Mount{
+				Type:       volume.MountType(m.Type),
+				Source:     m.Source,
+				Target:     m.Target,
+				ReadOnly:   m.ReadOnly,
+				VolumePath: m.VolumePath,
+			}
+		}
+	}
+
+	return config, nil
 }
 
 // setupContainerEnvironment 配置容器环境。
@@ -108,10 +125,16 @@ func setupContainerEnvironment(config *ContainerConfig) error {
 	// 3. Phase 2 移除旧的 mountProc() 调用
 	// 因为 setupRootfs() 已经在 pivot_root 后正确挂载了 /proc
 
-	// 未来扩展点（第2阶段+）：
-	// - setupCgroups(config)  // 第6阶段: cgroup 资源限制
-	// - setupNetwork(config)  // 第7阶段: 网络配置
-	// - setupMounts(config)   // 第10阶段: 卷挂载
+	// Phase 10: 设置卷挂载（必须在 pivot_root 之后执行）
+	if len(config.Mounts) > 0 {
+		if err := setupMounts(config.Mounts); err != nil {
+			return fmt.Errorf("setup mounts: %w", err)
+		}
+	}
+
+	// 未来扩展点：
+	// - setupCgroups(config)  // 第6阶段: cgroup 资源限制（在父进程中处理）
+	// - setupNetwork(config)  // 第7阶段: 网络配置（在父进程中处理）
 
 	return nil
 }
@@ -257,4 +280,51 @@ func reapZombies(mainChildPid int) (int, bool) {
 	}
 
 	return mainChildExitCode, mainChildExited
+}
+
+// setupMounts 在容器内执行卷挂载
+// 必须在 pivot_root 之后调用，此时路径已相对于新的根目录
+func setupMounts(mounts []volume.Mount) error {
+	for _, m := range mounts {
+		if err := performMount(m); err != nil {
+			return fmt.Errorf("mount %s -> %s: %w", m.Source, m.Target, err)
+		}
+	}
+	return nil
+}
+
+// performMount 执行单个挂载
+func performMount(m volume.Mount) error {
+	// 确定源路径
+	source := m.Source
+	if m.Type == volume.MountTypeVolume {
+		// 对于 named volumes，使用已解析的 VolumePath
+		source = m.VolumePath
+	}
+
+	target := m.Target
+
+	// 确保目标目录存在
+	if err := os.MkdirAll(target, 0755); err != nil {
+		return fmt.Errorf("create mount target %s: %w", target, err)
+	}
+
+	// 执行 bind mount
+	// MS_BIND: 创建 bind mount
+	// MS_REC: 递归挂载（挂载子树）
+	flags := uintptr(unix.MS_BIND | unix.MS_REC)
+	if err := unix.Mount(source, target, "", flags, ""); err != nil {
+		return fmt.Errorf("bind mount %s -> %s: %w", source, target, err)
+	}
+
+	// 如果是只读挂载，需要重新挂载为只读
+	// 注意：必须使用 MS_REMOUNT 标志
+	if m.ReadOnly {
+		flags := uintptr(unix.MS_BIND | unix.MS_REC | unix.MS_RDONLY | unix.MS_REMOUNT)
+		if err := unix.Mount("", target, "", flags, ""); err != nil {
+			return fmt.Errorf("remount %s as read-only: %w", target, err)
+		}
+	}
+
+	return nil
 }

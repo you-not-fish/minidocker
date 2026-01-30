@@ -3,6 +3,7 @@ package runtime
 import (
 	"minidocker/internal/cgroups"
 	"minidocker/internal/network"
+	"minidocker/internal/volume"
 	"minidocker/pkg/idutil"
 )
 
@@ -62,11 +63,9 @@ type ContainerConfig struct {
 	// 与 Rootfs 互斥：有 Image 时，run 命令使用 snapshotter 准备 rootfs
 	Image string
 
-	// --- 用于未来扩展的占位符字段 ---
-	// 这些被注释掉是为了避免循环导入和未使用的代码警告。
-	// 在后续阶段根据需要取消注释并实现。
-	//
-	// Mounts []Mount // 第10阶段：卷挂载
+	// --- Phase 10: 卷挂载 ---
+	// Mounts 保存容器的挂载配置（bind mounts 和 named volumes）
+	Mounts []volume.Mount
 }
 
 // GenerateContainerID 生成一个随机的64个字符的十六进制字符串。
