@@ -52,6 +52,9 @@ func init() {
 	rootCmd.AddCommand(logsCmd)    // Phase 4 新增
 	rootCmd.AddCommand(inspectCmd) // Phase 4 新增
 	rootCmd.AddCommand(execCmd)    // Phase 5 新增
+	rootCmd.AddCommand(imagesCmd)  // Phase 8 新增
+	rootCmd.AddCommand(rmiCmd)     // Phase 8 新增
+	rootCmd.AddCommand(loadCmd)    // Phase 8 新增
 
 	// Phase 3: 全局标志
 	rootCmd.PersistentFlags().StringVar(&rootDir, "root", "",
