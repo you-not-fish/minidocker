@@ -237,11 +237,6 @@ func RunContainerShim() {
 		if err := prepareMounts(rCfg.Mounts, rootDir); err != nil {
 			fail("prepare mounts: %v", err)
 		}
-
-		// 更新状态配置中的 VolumePath（用于持久化）
-		for i := range cfg.Mounts {
-			cfg.Mounts[i].VolumePath = rCfg.Mounts[i].VolumePath
-		}
 	}
 
 	// Open log files for the container init

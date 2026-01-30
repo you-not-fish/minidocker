@@ -64,7 +64,7 @@ func (l *logFiles) Close() {
 // Phase 10 更新：
 // - 集成卷挂载配置（bind mounts 和 named volumes）
 // - 在启动进程前解析 named volumes（自动创建不存在的卷）
-// - 卷挂载在 init 进程中执行（pivot_root 之后）
+// - 卷挂载在 init 进程中执行（在 pivot_root 前挂到 rootfs/<target>，对齐 runc）
 //
 // 注意：这个函数不应该调用 os.Exit。
 // 退出码应由 CLI（或后续阶段的 daemon/manager）统一处理。

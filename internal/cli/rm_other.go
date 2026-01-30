@@ -27,5 +27,5 @@ var rmCmd = &cobra.Command{
 
 func init() {
 	rmCmd.Flags().BoolVarP(&rmForce, "force", "f", false, "强制删除运行中的容器")
-	rmCmd.Flags().BoolVarP(&rmVolumes, "volumes", "v", false, "删除关联的卷（Phase 10 实现）")
+	rmCmd.Flags().BoolVarP(&rmVolumes, "volumes", "v", false, "预留：删除关联的卷（当前不实现，命名卷默认持久化）")
 }

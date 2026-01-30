@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -125,9 +126,11 @@ func setupContainerEnvironment(config *ContainerConfig) error {
 	// 3. Phase 2 移除旧的 mountProc() 调用
 	// 因为 setupRootfs() 已经在 pivot_root 后正确挂载了 /proc
 
-	// Phase 10: 设置卷挂载（必须在 pivot_root 之后执行）
-	if len(config.Mounts) > 0 {
-		if err := setupMounts(config.Mounts); err != nil {
+	// Phase 10: 卷挂载
+	// - 当存在 rootfs（会 pivot_root）时：挂载在 setupRootfs() 中、pivot_root 之前完成（对齐 runc）
+	// - 当没有 rootfs（Phase 1 兼容）时：直接挂到当前 "/" 下的目标路径
+	if config.Rootfs == "" && len(config.Mounts) > 0 {
+		if err := setupMounts("", config.Mounts); err != nil {
 			return fmt.Errorf("setup mounts: %w", err)
 		}
 	}
@@ -282,11 +285,21 @@ func reapZombies(mainChildPid int) (int, bool) {
 	return mainChildExitCode, mainChildExited
 }
 
-// setupMounts 在容器内执行卷挂载
-// 必须在 pivot_root 之后调用，此时路径已相对于新的根目录
-func setupMounts(mounts []volume.Mount) error {
+// setupMounts 执行卷挂载。
+//
+// 当 rootfs != "" 时，挂载目标会被映射到 rootfs 下（例如 rootfs + "/data"），
+// 以便后续 pivot_root 后在容器内表现为 "/data"。
+// 这能确保 mount(2) 的 source（宿主路径）在 pivot_root 前仍可解析（对齐 runc 的做法）。
+func setupMounts(rootfs string, mounts []volume.Mount) error {
+	if rootfs != "" {
+		abs, err := filepath.Abs(rootfs)
+		if err != nil {
+			return fmt.Errorf("abs rootfs: %w", err)
+		}
+		rootfs = abs
+	}
 	for _, m := range mounts {
-		if err := performMount(m); err != nil {
+		if err := performMount(rootfs, m); err != nil {
 			return fmt.Errorf("mount %s -> %s: %w", m.Source, m.Target, err)
 		}
 	}
@@ -294,37 +307,124 @@ func setupMounts(mounts []volume.Mount) error {
 }
 
 // performMount 执行单个挂载
-func performMount(m volume.Mount) error {
-	// 确定源路径
-	source := m.Source
-	if m.Type == volume.MountTypeVolume {
-		// 对于 named volumes，使用已解析的 VolumePath
-		source = m.VolumePath
+func performMount(rootfs string, m volume.Mount) error {
+	source, err := resolveMountSource(m)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(source) == "" {
+		return fmt.Errorf("empty mount source for target %s", m.Target)
 	}
 
 	target := m.Target
-
-	// 确保目标目录存在
-	if err := os.MkdirAll(target, 0755); err != nil {
-		return fmt.Errorf("create mount target %s: %w", target, err)
+	if rootfs != "" {
+		// target is an absolute container path; map it under rootfs for pre-pivot mounting.
+		target = filepath.Join(rootfs, strings.TrimPrefix(m.Target, "/"))
 	}
 
-	// 执行 bind mount
-	// MS_BIND: 创建 bind mount
-	// MS_REC: 递归挂载（挂载子树）
-	flags := uintptr(unix.MS_BIND | unix.MS_REC)
+	// Ensure mount target exists and matches source type (file vs dir).
+	isDir, err := ensureMountTarget(source, target)
+	if err != nil {
+		return err
+	}
+
+	// Perform bind mount.
+	flags := uintptr(unix.MS_BIND)
+	if isDir {
+		flags |= uintptr(unix.MS_REC)
+	}
 	if err := unix.Mount(source, target, "", flags, ""); err != nil {
 		return fmt.Errorf("bind mount %s -> %s: %w", source, target, err)
 	}
 
-	// 如果是只读挂载，需要重新挂载为只读
-	// 注意：必须使用 MS_REMOUNT 标志
+	// Read-only bind mounts require a remount with MS_RDONLY|MS_REMOUNT.
 	if m.ReadOnly {
-		flags := uintptr(unix.MS_BIND | unix.MS_REC | unix.MS_RDONLY | unix.MS_REMOUNT)
-		if err := unix.Mount("", target, "", flags, ""); err != nil {
+		remountFlags := uintptr(unix.MS_BIND | unix.MS_REMOUNT | unix.MS_RDONLY)
+		if isDir {
+			remountFlags |= uintptr(unix.MS_REC)
+		}
+		if err := unix.Mount("", target, "", remountFlags, ""); err != nil {
 			return fmt.Errorf("remount %s as read-only: %w", target, err)
 		}
 	}
 
 	return nil
+}
+
+func ensureMountTarget(source, target string) (bool, error) {
+	srcInfo, err := os.Stat(source)
+	if err != nil {
+		return false, fmt.Errorf("stat mount source %s: %w", source, err)
+	}
+
+	if srcInfo.IsDir() {
+		if err := os.MkdirAll(target, 0755); err != nil {
+			return false, fmt.Errorf("create mount target dir %s: %w", target, err)
+		}
+		return true, nil
+	}
+
+	// Source is a file: ensure the parent dir exists and create an empty target file if needed.
+	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+		return false, fmt.Errorf("create mount target parent dir %s: %w", filepath.Dir(target), err)
+	}
+	if fi, err := os.Stat(target); err == nil {
+		if fi.IsDir() {
+			return false, fmt.Errorf("mount target %s is a directory, but source %s is a file", target, source)
+		}
+		return false, nil
+	}
+	f, err := os.OpenFile(target, os.O_CREATE, 0644)
+	if err != nil {
+		return false, fmt.Errorf("create mount target file %s: %w", target, err)
+	}
+	_ = f.Close()
+	return false, nil
+}
+
+func resolveMountSource(m volume.Mount) (string, error) {
+	switch m.Type {
+	case volume.MountTypeBind:
+		return m.Source, nil
+	case volume.MountTypeVolume:
+		// Prefer VolumePath if present; otherwise resolve via volume store using MINIDOCKER_STATE_PATH.
+		if strings.TrimSpace(m.VolumePath) != "" {
+			return m.VolumePath, nil
+		}
+		return resolveNamedVolumePath(m.Source)
+	default:
+		return "", fmt.Errorf("unknown mount type: %s", m.Type)
+	}
+}
+
+func resolveNamedVolumePath(name string) (string, error) {
+	containerDir := os.Getenv(envutil.StatePathEnvVar)
+	if strings.TrimSpace(containerDir) == "" {
+		return "", fmt.Errorf("missing %s environment variable (cannot resolve named volume %q)", envutil.StatePathEnvVar, name)
+	}
+
+	// containerDir is <rootDir>/containers/<id>
+	rootDir := filepath.Dir(filepath.Dir(containerDir))
+
+	vs, err := volume.NewVolumeStore(rootDir)
+	if err != nil {
+		return "", fmt.Errorf("initialize volume store: %w", err)
+	}
+
+	// Auto-create if not exists (Docker-like behavior).
+	if !vs.Exists(name) {
+		if _, err := vs.Create(name); err != nil {
+			// A concurrent creator may have won; re-check exists.
+			if !vs.Exists(name) {
+				return "", fmt.Errorf("create volume %q: %w", name, err)
+			}
+		}
+	}
+
+	vol, err := vs.Get(name)
+	if err != nil {
+		return "", fmt.Errorf("get volume %q: %w", name, err)
+	}
+
+	return vol.Path, nil
 }

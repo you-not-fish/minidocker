@@ -49,6 +49,15 @@ func setupRootfs(config *ContainerConfig) error {
 		return fmt.Errorf("bind mount rootfs: %w", err)
 	}
 
+	// Phase 10: 先把用户 mounts 挂到 rootfs/<target> 上，再 pivot_root。
+	// 这样 mount(2) 的 source（宿主路径/卷路径）仍可解析，同时 pivot_root 后容器内可见路径为 /<target>。
+	// 这对齐 runc 的常见实现方式：在 pivot_root 前把 mounts 准备到 newRoot 下。
+	if len(config.Mounts) > 0 {
+		if err := setupMounts(rootfs, config.Mounts); err != nil {
+			return fmt.Errorf("setup mounts: %w", err)
+		}
+	}
+
 	// 4. 执行 pivot_root 切换根
 	if err := pivotRoot(rootfs); err != nil {
 		return fmt.Errorf("pivot_root: %w", err)

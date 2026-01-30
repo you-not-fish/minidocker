@@ -22,7 +22,7 @@ import (
 
 var (
 	rmForce   bool
-	rmVolumes bool // Phase 10 预留：删除关联的卷
+	rmVolumes bool // Phase 10 预留：删除关联的卷（当前不实现）
 )
 
 var rmCmd = &cobra.Command{
@@ -43,11 +43,16 @@ var rmCmd = &cobra.Command{
 
 func init() {
 	rmCmd.Flags().BoolVarP(&rmForce, "force", "f", false, "强制删除运行中的容器")
-	// Phase 10 预留：卷管理
-	rmCmd.Flags().BoolVarP(&rmVolumes, "volumes", "v", false, "删除关联的卷（Phase 10 实现）")
+	// Phase 10 预留：卷管理（当前不实现，命名卷默认持久化；请使用 `minidocker volume rm` 显式删除）
+	rmCmd.Flags().BoolVarP(&rmVolumes, "volumes", "v", false, "预留：删除关联的卷（当前不实现，命名卷默认持久化）")
 }
 
 func removeContainers(cmd *cobra.Command, args []string) error {
+	if rmVolumes {
+		// Avoid a silent no-op: be explicit that this is reserved.
+		return fmt.Errorf("--volumes/-v is reserved: named volumes are persistent; use `minidocker volume rm` to delete volumes explicitly")
+	}
+
 	store, err := state.NewStore(rootDir)
 	if err != nil {
 		return fmt.Errorf("failed to initialize state store: %w", err)
