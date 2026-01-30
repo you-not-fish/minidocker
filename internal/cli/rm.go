@@ -6,12 +6,15 @@ package cli
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"minidocker/internal/cgroups"
+	"minidocker/internal/image"
 	"minidocker/internal/network"
+	"minidocker/internal/snapshot"
 	"minidocker/internal/state"
 
 	"github.com/spf13/cobra"
@@ -106,8 +109,21 @@ func removeContainer(store *state.Store, idOrPrefix string) error {
 		}
 	}
 
+	// Phase 9: 清理快照（unmount overlay + 删除 upper/work）
+	// 清理顺序: Snapshot → Network → cgroup → 状态目录
+	// Note: snapshot cleanup is idempotent. We attempt cleanup even if state.json
+	// is missing SnapshotPath (e.g., older state or partial failures), to avoid
+	// leaking overlay mounts and upper/work directories.
+	imageRoot := filepath.Join(store.RootDir, image.DefaultImagesDir)
+	if imageStore, err := image.NewStore(imageRoot); err == nil {
+		if snapshotter, err := snapshot.NewSnapshotter(store.RootDir, imageStore); err == nil {
+			// 忽略清理错误（快照可能已被清理）
+			_ = snapshotter.Remove(containerState.ID)
+		}
+	}
+
 	// Phase 7: 清理网络（仅 bridge 模式会创建宿主侧资源：veth/iptables/IPAM）
-	// 清理顺序: Network → cgroup → 状态目录
+	// 清理顺序: Snapshot → Network → cgroup → 状态目录
 	if containerState.NetworkState != nil && containerState.NetworkState.Mode == string(network.NetworkModeBridge) {
 		if manager, err := network.NewManager(store.RootDir); err == nil {
 			// 转换 state.NetworkState 到 network.NetworkState

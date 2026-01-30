@@ -12,8 +12,10 @@ import (
 	"strings"
 
 	"minidocker/internal/cgroups"
+	"minidocker/internal/image"
 	"minidocker/internal/network"
 	"minidocker/internal/runtime"
+	"minidocker/internal/snapshot"
 	"minidocker/internal/state"
 
 	"github.com/spf13/cobra"
@@ -41,7 +43,7 @@ var (
 )
 
 var runCmd = &cobra.Command{
-	Use:   "run [flags] COMMAND [ARG...]",
+	Use:   "run [flags] [IMAGE] COMMAND [ARG...]",
 	Short: "在新容器中运行命令",
 	Long: `使用指定命令创建并运行一个新容器。
 
@@ -51,6 +53,11 @@ var runCmd = &cobra.Command{
   - Mount namespace (文件系统隔离)
   - IPC namespace (进程间通信隔离)
   - Network namespace (网络隔离，Phase 7)
+
+镜像支持（Phase 9）：
+  - 指定镜像名称或 digest 作为第一个参数
+  - 使用 --rootfs 显式指定 rootfs 目录（向后兼容）
+  - 镜像和 --rootfs 互斥
 
 资源限制（Phase 6，需要 cgroup v2）：
   - 内存限制: -m, --memory
@@ -63,15 +70,16 @@ var runCmd = &cobra.Command{
   - none: 只有 loopback 的独立网络命名空间
 
 示例:
-  minidocker run /bin/sh
-  minidocker run -it /bin/bash
-  minidocker run /bin/echo "Hello from container"
-  minidocker run -d --rootfs /tmp/rootfs /bin/sleep 100
-  minidocker run -m 512m --cpus 0.5 --rootfs /tmp/rootfs /bin/sh
-  minidocker run --pids-limit 100 --rootfs /tmp/rootfs /bin/sh
-  minidocker run --network bridge --rootfs /tmp/rootfs /bin/sh
-  minidocker run --network host --rootfs /tmp/rootfs /bin/sh
-  minidocker run -p 8080:80 --rootfs /tmp/rootfs /bin/httpd`,
+  minidocker run alpine:latest /bin/sh
+  minidocker run -it alpine /bin/sh
+  minidocker run alpine /bin/echo "Hello from container"
+  minidocker run -d alpine /bin/sleep 100
+  minidocker run -m 512m --cpus 0.5 alpine /bin/sh
+  minidocker run --pids-limit 100 alpine /bin/sh
+  minidocker run --network bridge alpine /bin/sh
+  minidocker run --network host alpine /bin/sh
+  minidocker run -p 8080:80 alpine /bin/httpd
+  minidocker run --rootfs /tmp/rootfs /bin/sh`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: runContainer,
 }
@@ -105,6 +113,22 @@ func init() {
 }
 
 func runContainer(cmd *cobra.Command, args []string) error {
+	// Phase 9: 解析参数，确定是使用镜像还是 rootfs
+	var imageRef string
+	var command []string
+
+	if rootfs != "" {
+		// 使用 --rootfs：所有参数都是命令
+		command = args
+	} else {
+		// 没有 --rootfs：第一个参数是镜像，其余是命令
+		if len(args) < 2 {
+			return fmt.Errorf("usage: run [IMAGE] COMMAND [ARG...] or run --rootfs PATH COMMAND [ARG...]")
+		}
+		imageRef = args[0]
+		command = args[1:]
+	}
+
 	// Phase 2: rootfs 路径验证（在父进程中验证，避免子进程启动失败）
 	if rootfs != "" {
 		// 转换为绝对路径（避免 chdir 后路径错乱）
@@ -152,25 +176,70 @@ func runContainer(cmd *cobra.Command, args []string) error {
 	}
 
 	config := &runtime.ContainerConfig{
-		Command: args[0:1],
-		Args:    args[1:],
+		Command: command[0:1],
+		Args:    command[1:],
 		// Phase 1: 记录 `-t` 但不分配 PTY（见 docs/phase1-dev-notes.md）。
 		TTY:           tty,
 		Rootfs:        rootfs,        // Phase 2 新增
 		Detached:      detach,        // Phase 3 新增
 		CgroupConfig:  cgroupConfig,  // Phase 6 新增
 		NetworkConfig: networkConfig, // Phase 7 新增
+		Image:         imageRef,      // Phase 9 新增
 	}
 
 	// 生成容器 ID（64位十六进制，前12位用作默认主机名）
 	config.ID = runtime.GenerateContainerID()
 	config.Hostname = config.ID[:12]
 
+	// Phase 9: 如果指定了镜像，使用 snapshotter 准备 rootfs
+	if imageRef != "" {
+		// 初始化镜像存储
+		imageRoot := filepath.Join(store.RootDir, image.DefaultImagesDir)
+		imageStore, err := image.NewStore(imageRoot)
+		if err != nil {
+			return fmt.Errorf("initialize image store: %w", err)
+		}
+
+		// 获取镜像
+		img, err := imageStore.Get(imageRef)
+		if err != nil {
+			return fmt.Errorf("image not found: %w", err)
+		}
+
+		// 后台模式（-d）：snapshot 由 shim 进程准备与清理（对齐 containerd-shim 模型）。
+		// 前台模式：在父进程中准备 snapshot（提取层并挂载 overlay）。
+		if !detach {
+			// 初始化 snapshotter
+			snapshotter, err := snapshot.NewSnapshotter(store.RootDir, imageStore)
+			if err != nil {
+				return fmt.Errorf("initialize snapshotter: %w", err)
+			}
+
+			// 准备 snapshot（提取层并挂载 overlay）
+			rootfsPath, err := snapshotter.Prepare(config.ID, img.Manifest, img.Config)
+			if err != nil {
+				return fmt.Errorf("prepare snapshot: %w", err)
+			}
+
+			// 设置 rootfs 路径
+			config.Rootfs = rootfsPath
+		}
+	}
+
 	// Phase 3: 传入状态存储
 	exitCode, err := runtime.Run(config, &runtime.RunOptions{
 		StateStore: store,
 	})
 	if err != nil {
+		// Phase 9: 如果失败，清理 snapshot
+		if imageRef != "" {
+			imageRoot := filepath.Join(store.RootDir, image.DefaultImagesDir)
+			if imageStore, storeErr := image.NewStore(imageRoot); storeErr == nil {
+				if snapshotter, snapErr := snapshot.NewSnapshotter(store.RootDir, imageStore); snapErr == nil {
+					_ = snapshotter.Remove(config.ID)
+				}
+			}
+		}
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}

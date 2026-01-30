@@ -52,6 +52,12 @@ type ContainerState struct {
 	// Phase 7: 网络状态
 	NetworkState *NetworkState `json:"networkState,omitempty"`
 
+	// Phase 9: 快照路径（用于清理）
+	SnapshotPath string `json:"snapshotPath,omitempty"`
+
+	// Phase 9: 镜像引用（用于显示）
+	ImageRef string `json:"imageRef,omitempty"`
+
 	// 内部字段（不序列化）
 	containerDir string
 }
@@ -146,6 +152,8 @@ func (s *ContainerState) Reload() error {
 	s.ExitCode = newState.ExitCode
 	s.CgroupPath = newState.CgroupPath       // Phase 6
 	s.NetworkState = newState.NetworkState   // Phase 7
+	s.SnapshotPath = newState.SnapshotPath   // Phase 9
+	s.ImageRef = newState.ImageRef           // Phase 9
 
 	return nil
 }

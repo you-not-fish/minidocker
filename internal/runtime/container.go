@@ -57,6 +57,11 @@ type ContainerConfig struct {
 	// NetworkConfig 保存容器的网络配置（模式、端口映射等）
 	NetworkConfig *network.NetworkConfig
 
+	// --- Phase 9: 镜像配置 ---
+	// Image 是镜像引用（例如 "alpine:latest" 或 "sha256:..."）
+	// 与 Rootfs 互斥：有 Image 时，run 命令使用 snapshotter 准备 rootfs
+	Image string
+
 	// --- 用于未来扩展的占位符字段 ---
 	// 这些被注释掉是为了避免循环导入和未使用的代码警告。
 	// 在后续阶段根据需要取消注释并实现。

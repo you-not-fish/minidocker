@@ -61,6 +61,11 @@ type ContainerConfig struct {
 	// 端口映射
 	PortMappings []PortMapping `json:"portMappings,omitempty"`
 
+	// --- Phase 9: 镜像配置 ---
+	// 镜像引用（例如 "alpine:latest" 或 "sha256:..."）
+	// 与 Rootfs 互斥：有 Image 时使用 snapshotter 准备 rootfs
+	Image string `json:"image,omitempty"`
+
 	// --- Phase 11 预留字段（当前不实现）---
 	// Name 容器名称
 	// 在 Phase 11 实现完整的名称到 ID 的映射功能

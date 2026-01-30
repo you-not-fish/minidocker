@@ -15,6 +15,7 @@ import (
 
 	"minidocker/internal/cgroups"
 	"minidocker/internal/network"
+	"minidocker/internal/snapshot"
 	"minidocker/internal/state"
 	"minidocker/pkg/envutil"
 
@@ -66,6 +67,13 @@ func Run(config *ContainerConfig, opts *RunOptions) (int, error) {
 		return -1, fmt.Errorf("RunOptions with StateStore is required")
 	}
 
+	// Phase 9: if running from an image, rootfs is an overlay mount under snapshots.
+	// For detached mode, snapshot is prepared in the shim, so Rootfs may be empty here.
+	// Still, we record the deterministic mount path for observability.
+	if config.Image != "" && config.Rootfs == "" {
+		config.Rootfs = filepath.Join(opts.StateStore.RootDir, snapshot.DefaultSnapshotsDir, "containers", config.ID, "rootfs")
+	}
+
 	// 1. 创建状态目录和初始状态
 	stateConfig := &state.ContainerConfig{
 		ID:       config.ID,
@@ -75,6 +83,7 @@ func Run(config *ContainerConfig, opts *RunOptions) (int, error) {
 		Rootfs:   config.Rootfs,
 		TTY:      config.TTY,
 		Detached: config.Detached,
+		Image:    config.Image, // Phase 9
 	}
 
 	// Phase 6: 添加 cgroup 配置到状态
@@ -105,6 +114,14 @@ func Run(config *ContainerConfig, opts *RunOptions) (int, error) {
 	containerState, err := opts.StateStore.Create(stateConfig)
 	if err != nil {
 		return -1, fmt.Errorf("failed to create container state: %w", err)
+	}
+
+	// Phase 9: persist image/snapshot metadata for observability and cleanup.
+	if config.Image != "" {
+		containerState.ImageRef = config.Image
+		containerState.SnapshotPath = filepath.Join(opts.StateStore.RootDir, snapshot.DefaultSnapshotsDir, "containers", config.ID)
+		// Best-effort: if this fails, we still allow the container to run.
+		_ = containerState.Save()
 	}
 
 	// Phase 7: 在 state.json 中至少持久化网络模式（包括 host/none）。

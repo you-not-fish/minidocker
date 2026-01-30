@@ -11,7 +11,9 @@ import (
 	"strings"
 
 	"minidocker/internal/cgroups"
+	"minidocker/internal/image"
 	"minidocker/internal/network"
+	"minidocker/internal/snapshot"
 	"minidocker/internal/state"
 	"minidocker/pkg/envutil"
 )
@@ -31,6 +33,10 @@ import (
 // - 配置网络（bridge/host/none 模式）
 // - 容器退出后清理网络资源
 //
+// Phase 9 更新：
+// - 使用 snapshotter 准备镜像 rootfs
+// - 容器退出后清理快照（unmount overlay + 删除 upper/work）
+//
 // This aligns with the industry "per-container shim" model (e.g. containerd-shim).
 func RunContainerShim() {
 	containerDir := os.Getenv(envutil.StatePathEnvVar)
@@ -45,11 +51,19 @@ func RunContainerShim() {
 	var networkState *network.NetworkState
 	var containerID string // 用于清理时引用
 
+	// Phase 9: snapshot 相关变量
+	var snapshotter snapshot.Snapshotter
+	var snapshotPath string
+
 	fail := func(format string, args ...any) {
 		msg := fmt.Sprintf(format, args...)
 		if notify != nil {
 			fmt.Fprintf(notify, "ERR: %s\n", msg)
 			notify.Close()
+		}
+		// Phase 9: 清理快照（先于网络和 cgroup）
+		if snapshotter != nil && containerID != "" {
+			_ = snapshotter.Remove(containerID)
 		}
 		// Phase 7: 清理网络
 		if networkManager != nil && networkState != nil && containerID != "" {
@@ -89,6 +103,46 @@ func RunContainerShim() {
 		Rootfs:   cfg.Rootfs,
 		TTY:      cfg.TTY,
 		Detached: true, // shim only exists for detached containers
+		Image:    cfg.Image,
+	}
+
+	// Phase 9: 从配置中恢复镜像配置并准备 snapshot
+	if cfg.Image != "" {
+		// 获取 rootDir（从 containerDir 向上两级）
+		rootDir := filepath.Dir(filepath.Dir(containerDir))
+
+		// 初始化镜像存储
+		imageRoot := filepath.Join(rootDir, image.DefaultImagesDir)
+		imageStore, err := image.NewStore(imageRoot)
+		if err != nil {
+			fail("initialize image store: %v", err)
+		}
+
+		// 获取镜像
+		img, err := imageStore.Get(cfg.Image)
+		if err != nil {
+			fail("get image: %v", err)
+		}
+
+		// 初始化 snapshotter
+		snapshotter, err = snapshot.NewSnapshotter(rootDir, imageStore)
+		if err != nil {
+			fail("initialize snapshotter: %v", err)
+		}
+
+		// 准备 snapshot（提取层并挂载 overlay）
+		rootfsPath, err := snapshotter.Prepare(cfg.ID, img.Manifest, img.Config)
+		if err != nil {
+			fail("prepare snapshot: %v", err)
+		}
+
+		// 更新 rootfs 路径
+		rCfg.Rootfs = rootfsPath
+		snapshotPath = filepath.Join(rootDir, snapshot.DefaultSnapshotsDir, "containers", cfg.ID)
+
+		// 更新状态中的快照路径
+		st.SnapshotPath = snapshotPath
+		st.ImageRef = cfg.Image
 	}
 
 	// Phase 6: 从配置中恢复 cgroup 配置
@@ -236,6 +290,11 @@ func RunContainerShim() {
 	_ = st.SetStopped(exitCode)
 	logs.Close()
 
+	// Phase 9: 清理快照（先于网络和 cgroup）
+	if snapshotter != nil {
+		_ = snapshotter.Remove(cfg.ID)
+	}
+
 	// Phase 7: 清理网络（先于 cgroup）
 	if networkManager != nil && networkState != nil {
 		_ = networkManager.Teardown(cfg.ID, networkState)
@@ -245,6 +304,9 @@ func RunContainerShim() {
 	if cgroupManager != nil && cgroupPath != "" {
 		_ = cgroupManager.Destroy(cgroupPath)
 	}
+
+	// Mark snapshotPath as used to avoid compiler warning
+	_ = snapshotPath
 
 	os.Exit(0)
 }

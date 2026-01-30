@@ -5,6 +5,7 @@ package integration
 
 import (
 	"archive/tar"
+	"bytes"
 	"encoding/json"
 	"io"
 	"os"
@@ -216,8 +217,12 @@ func createTestOCITar(t *testing.T, tarPath string) digest.Digest {
 	layout := `{"imageLayoutVersion":"1.0.0"}`
 	writeTestTarEntry(t, tw, "oci-layout", []byte(layout))
 
-	// 2. Create a minimal layer (empty tar)
-	layerContent := []byte{} // Empty layer
+	// 2. Create a minimal valid layer (empty tar archive).
+	// Note: layer blob must be a tar/tar.gz stream, not an empty byte slice.
+	var layerBuf bytes.Buffer
+	layerTW := tar.NewWriter(&layerBuf)
+	_ = layerTW.Close()
+	layerContent := layerBuf.Bytes()
 	layerDigest := digest.FromBytes(layerContent)
 	writeTestTarEntry(t, tw, "blobs/sha256/"+layerDigest.Encoded(), layerContent)
 
@@ -284,7 +289,7 @@ func writeTestTarEntry(t *testing.T, tw *tar.Writer, name string, data []byte) {
 	if err := tw.WriteHeader(header); err != nil {
 		t.Fatalf("write tar header for %s: %v", name, err)
 	}
-	if _, err := io.Copy(tw, strings.NewReader(string(data))); err != nil {
+	if _, err := io.Copy(tw, bytes.NewReader(data)); err != nil {
 		t.Fatalf("write tar content for %s: %v", name, err)
 	}
 }
