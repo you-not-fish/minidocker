@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/google/go-containerregistry/pkg/v1"
 	"github.com/spf13/cobra"
@@ -96,20 +97,24 @@ func runPull(cmd *cobra.Command, args []string) error {
 
 // parsePlatform parses a platform string like "linux/amd64" into a v1.Platform.
 func parsePlatform(s string) (*v1.Platform, error) {
-	var platform v1.Platform
-	var variant string
+	parts := strings.Split(s, "/")
+	if len(parts) < 2 || len(parts) > 3 {
+		return nil, fmt.Errorf("expected format: os/arch[/variant], got: %s", s)
+	}
 
-	// Parse os/arch or os/arch/variant
-	n, err := fmt.Sscanf(s, "%s/%s/%s", &platform.OS, &platform.Architecture, &variant)
-	if err != nil || n < 2 {
-		// Try simpler format
-		n, err = fmt.Sscanf(s, "%s/%s", &platform.OS, &platform.Architecture)
-		if err != nil || n != 2 {
+	platform := v1.Platform{
+		OS:           strings.TrimSpace(parts[0]),
+		Architecture: strings.TrimSpace(parts[1]),
+	}
+	if platform.OS == "" || platform.Architecture == "" {
+		return nil, fmt.Errorf("expected format: os/arch[/variant], got: %s", s)
+	}
+
+	if len(parts) == 3 {
+		platform.Variant = strings.TrimSpace(parts[2])
+		if platform.Variant == "" {
 			return nil, fmt.Errorf("expected format: os/arch[/variant], got: %s", s)
 		}
-	}
-	if variant != "" {
-		platform.Variant = variant
 	}
 
 	return &platform, nil

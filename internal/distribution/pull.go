@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -51,7 +52,7 @@ func Pull(ref string, store image.Store, opts *PullOptions) (digest.Digest, erro
 
 	output := opts.Output
 	if output == nil {
-		output = io.Discard
+		output = os.Stdout
 	}
 
 	// Parse image reference
@@ -84,25 +85,26 @@ func Pull(ref string, store image.Store, opts *PullOptions) (digest.Digest, erro
 		return "", fmt.Errorf("get manifest: %w", err)
 	}
 
-	// Get manifest digest
-	manifestDigest, err := img.Digest()
+	// Convert manifest to OCI format and compute digest
+	ociManifest := convertToOCIManifest(manifest)
+	manifestBytes, err := json.Marshal(ociManifest)
 	if err != nil {
-		return "", fmt.Errorf("get manifest digest: %w", err)
+		return "", fmt.Errorf("marshal manifest: %w", err)
 	}
-	dgst := digest.Digest(manifestDigest.String())
+
+	ociDigest := digest.FromBytes(manifestBytes)
 
 	// Check if manifest already exists
-	if store.HasBlob(dgst) {
+	if store.HasBlob(ociDigest) {
 		if !opts.Quiet {
-			fmt.Fprintf(output, "Image already exists: %s\n", dgst)
+			fmt.Fprintf(output, "Image already exists: %s\n", ociDigest)
 		}
-		// Just update the tag mapping
+		// Update index/repositories without re-downloading layers.
 		refStr := formatReference(imgRef)
-		if err := store.AddManifest(nil, dgst, refStr); err != nil {
-			// Manifest already exists, just update tag
-			return dgst, store.Tag(dgst.String(), refStr)
+		if err := store.AddManifest(manifestBytes, ociDigest, refStr); err != nil {
+			return "", fmt.Errorf("update manifest: %w", err)
 		}
-		return dgst, nil
+		return ociDigest, nil
 	}
 
 	// Download layers
@@ -170,16 +172,6 @@ func Pull(ref string, store image.Store, opts *PullOptions) (digest.Digest, erro
 			return "", fmt.Errorf("store config: %w", err)
 		}
 	}
-
-	// Convert manifest to OCI format and store
-	ociManifest := convertToOCIManifest(manifest)
-	manifestBytes, err := json.Marshal(ociManifest)
-	if err != nil {
-		return "", fmt.Errorf("marshal manifest: %w", err)
-	}
-
-	// Recalculate digest for OCI manifest (may differ from Docker manifest)
-	ociDigest := digest.FromBytes(manifestBytes)
 
 	// Store manifest
 	refStr := formatReference(imgRef)

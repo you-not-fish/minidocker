@@ -620,6 +620,15 @@ func (s *imageStore) resolveReference(ref string) (digest.Digest, error) {
 		dgst, ok = repos.Refs[ref]
 	}
 	if !ok {
+		// Docker Hub short-name compatibility (busybox -> library/busybox).
+		for _, alias := range dockerHubRefAliases(normalizedRef) {
+			if alias == normalizedRef || alias == ref {
+				continue
+			}
+			if dgst, ok = repos.Refs[alias]; ok {
+				return dgst, nil
+			}
+		}
 		return "", fmt.Errorf("image not found: %s", normalizedRef)
 	}
 	return dgst, nil
@@ -690,6 +699,79 @@ func refHasTag(ref string) bool {
 	slash := strings.LastIndex(ref, "/")
 	colon := strings.LastIndex(ref, ":")
 	return colon > slash
+}
+
+// splitRepoTag splits a reference into repository and tag.
+// The tag is only recognized if it appears after the last "/".
+func splitRepoTag(ref string) (repo, tag string) {
+	slash := strings.LastIndex(ref, "/")
+	colon := strings.LastIndex(ref, ":")
+	if colon > slash {
+		return ref[:colon], ref[colon+1:]
+	}
+	return ref, ""
+}
+
+// splitRegistry splits a repository into registry and remainder.
+// If no registry is present, registry is empty and remainder is the input.
+func splitRegistry(repo string) (registry, remainder string) {
+	parts := strings.SplitN(repo, "/", 2)
+	if len(parts) == 1 {
+		return "", repo
+	}
+	if isRegistryHost(parts[0]) {
+		return parts[0], parts[1]
+	}
+	return "", repo
+}
+
+// isRegistryHost reports whether a name component should be treated as a registry.
+// This follows Docker's heuristic: contains "." or ":" or is "localhost".
+func isRegistryHost(component string) bool {
+	return strings.Contains(component, ".") || strings.Contains(component, ":") || component == "localhost"
+}
+
+// dockerHubRefAliases returns alternative references for Docker Hub short-name compatibility.
+// Examples:
+// - busybox:latest -> library/busybox:latest
+// - docker.io/library/busybox:latest -> library/busybox:latest, busybox:latest
+func dockerHubRefAliases(ref string) []string {
+	repo, tag := splitRepoTag(ref)
+	if repo == "" || tag == "" {
+		return nil
+	}
+
+	registry, remainder := splitRegistry(repo)
+	if registry != "" && registry != "docker.io" && registry != "index.docker.io" {
+		return nil
+	}
+
+	candidates := make(map[string]struct{})
+	add := func(r string) {
+		if r != "" {
+			candidates[r] = struct{}{}
+		}
+	}
+
+	base := repo
+	if registry != "" {
+		base = remainder
+		add(base + ":" + tag)
+	}
+
+	if strings.HasPrefix(base, "library/") {
+		add(strings.TrimPrefix(base, "library/") + ":" + tag)
+	}
+
+	if !strings.Contains(base, "/") {
+		add("library/" + base + ":" + tag)
+	}
+
+	aliases := make([]string, 0, len(candidates))
+	for r := range candidates {
+		aliases = append(aliases, r)
+	}
+	return aliases
 }
 
 // parseNamedDigest parses "name@sha256:..." and returns the digest.
