@@ -348,6 +348,140 @@ func (s *imageStore) HasBlob(dgst digest.Digest) bool {
 	return err == nil
 }
 
+// PutBlobWithDigest writes content with expected digest verification.
+// Returns error if the actual digest doesn't match expectedDigest.
+func (s *imageStore) PutBlobWithDigest(r io.Reader, expectedDigest digest.Digest, expectedSize int64) error {
+	// If blob already exists, skip writing (deduplication)
+	if s.HasBlob(expectedDigest) {
+		// Consume the reader to avoid connection issues
+		_, _ = io.Copy(io.Discard, r)
+		return nil
+	}
+
+	// Write to temp file while computing digest
+	tmpFile, err := os.CreateTemp(s.root, "blob-*")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer func() {
+		tmpFile.Close()
+		os.Remove(tmpPath) // Clean up temp file on error
+	}()
+
+	// Use a digester to compute hash while writing
+	digester := expectedDigest.Algorithm().Digester()
+	mw := io.MultiWriter(tmpFile, digester.Hash())
+
+	size, err := io.Copy(mw, r)
+	if err != nil {
+		return fmt.Errorf("write blob: %w", err)
+	}
+	tmpFile.Close()
+
+	actualDigest := digester.Digest()
+
+	// Verify digest
+	if actualDigest != expectedDigest {
+		return fmt.Errorf("digest mismatch: expected %s, got %s", expectedDigest, actualDigest)
+	}
+
+	// Verify size if provided (expectedSize > 0)
+	if expectedSize > 0 && size != expectedSize {
+		return fmt.Errorf("size mismatch: expected %d, got %d", expectedSize, size)
+	}
+
+	// Move to final location
+	blobPath := s.blobPath(expectedDigest)
+	if err := os.MkdirAll(filepath.Dir(blobPath), 0755); err != nil {
+		return fmt.Errorf("create blob directory: %w", err)
+	}
+
+	// Double-check if blob was created by another process
+	if s.HasBlob(expectedDigest) {
+		return nil
+	}
+
+	if err := os.Rename(tmpPath, blobPath); err != nil {
+		return fmt.Errorf("move blob: %w", err)
+	}
+
+	return nil
+}
+
+// AddManifest adds a manifest to the store and updates index.json.
+// If ref is provided, it also updates repositories.json.
+func (s *imageStore) AddManifest(manifestBytes []byte, manifestDigest digest.Digest, ref string) error {
+	// Verify the manifest digest
+	actualDigest := digest.FromBytes(manifestBytes)
+	if actualDigest != manifestDigest {
+		return fmt.Errorf("manifest digest mismatch: expected %s, got %s", manifestDigest, actualDigest)
+	}
+
+	// Write manifest as a blob
+	blobPath := s.blobPath(manifestDigest)
+	if err := os.MkdirAll(filepath.Dir(blobPath), 0755); err != nil {
+		return fmt.Errorf("create blob directory: %w", err)
+	}
+
+	if err := fileutil.AtomicWriteFile(blobPath, manifestBytes, 0644); err != nil {
+		return fmt.Errorf("write manifest blob: %w", err)
+	}
+
+	// Update index.json
+	index, err := s.loadIndex()
+	if err != nil {
+		return fmt.Errorf("load index: %w", err)
+	}
+
+	// Check if manifest already exists in index
+	manifestExists := false
+	for _, desc := range index.Manifests {
+		if desc.Digest == manifestDigest {
+			manifestExists = true
+			break
+		}
+	}
+
+	if !manifestExists {
+		// Add manifest to index
+		desc := ocispec.Descriptor{
+			MediaType: ocispec.MediaTypeImageManifest,
+			Digest:    manifestDigest,
+			Size:      int64(len(manifestBytes)),
+		}
+		index.Manifests = append(index.Manifests, desc)
+		if err := s.saveIndex(index); err != nil {
+			return fmt.Errorf("save index: %w", err)
+		}
+	}
+
+	// Update repositories.json if ref is provided
+	if ref != "" {
+		repos, err := s.loadRepositories()
+		if err != nil {
+			return fmt.Errorf("load repositories: %w", err)
+		}
+
+		// Normalize tag reference
+		if !isDigestReference(ref) && !strings.Contains(ref, "@") {
+			ref = normalizeTagRef(ref)
+		}
+
+		repos.Refs[ref] = manifestDigest
+		if err := s.saveRepositories(repos); err != nil {
+			return fmt.Errorf("save repositories: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// Root returns the root directory of the image store.
+func (s *imageStore) Root() string {
+	return s.root
+}
+
 // GetManifest returns parsed manifest for an image.
 func (s *imageStore) GetManifest(dgst digest.Digest) (*ocispec.Manifest, error) {
 	r, err := s.GetBlob(dgst)

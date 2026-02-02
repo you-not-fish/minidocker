@@ -64,6 +64,11 @@ type Store interface {
 	// PutBlob writes content and returns its digest and size.
 	PutBlob(r io.Reader) (digest.Digest, int64, error)
 
+	// PutBlobWithDigest writes content with expected digest verification.
+	// Returns error if the actual digest doesn't match expectedDigest.
+	// This is used by pull to verify downloaded blobs.
+	PutBlobWithDigest(r io.Reader, expectedDigest digest.Digest, expectedSize int64) error
+
 	// HasBlob checks if a blob exists.
 	HasBlob(dgst digest.Digest) bool
 
@@ -72,6 +77,13 @@ type Store interface {
 
 	// GetConfig returns parsed config for an image.
 	GetConfig(dgst digest.Digest) (*ocispec.Image, error)
+
+	// AddManifest adds a manifest to the store and updates index.json.
+	// If ref is provided, it also updates repositories.json.
+	AddManifest(manifestBytes []byte, manifestDigest digest.Digest, ref string) error
+
+	// Root returns the root directory of the image store.
+	Root() string
 }
 
 // Repositories holds the mapping from name:tag to manifest digest.

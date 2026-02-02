@@ -61,3 +61,15 @@ func (s *stubStore) GetManifest(dgst digest.Digest) (*ocispec.Manifest, error) {
 func (s *stubStore) GetConfig(dgst digest.Digest) (*ocispec.Image, error) {
 	return nil, errNotSupported
 }
+
+func (s *stubStore) PutBlobWithDigest(r io.Reader, expectedDigest digest.Digest, expectedSize int64) error {
+	return errNotSupported
+}
+
+func (s *stubStore) AddManifest(manifestBytes []byte, manifestDigest digest.Digest, ref string) error {
+	return errNotSupported
+}
+
+func (s *stubStore) Root() string {
+	return ""
+}

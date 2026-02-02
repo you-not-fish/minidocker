@@ -56,6 +56,7 @@ func init() {
 	rootCmd.AddCommand(rmiCmd)     // Phase 8 新增
 	rootCmd.AddCommand(loadCmd)    // Phase 8 新增
 	rootCmd.AddCommand(volumeCmd)  // Phase 10 新增
+	rootCmd.AddCommand(pullCmd)    // Phase 12 新增
 
 	// Phase 3: 全局标志
 	rootCmd.PersistentFlags().StringVar(&rootDir, "root", "",
